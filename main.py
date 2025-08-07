@@ -1,24 +1,24 @@
-import os
 import discord
 from discord.ext import commands
+from discord import app_commands
+import os
 
-# Get token from environment variable (set in Render)
-TOKEN = os.getenv("TOKEN")
-
-# Setup intents
+# Create the bot with default intents
 intents = discord.Intents.default()
-intents.message_content = True
-
-# Setup bot
 bot = commands.Bot(command_prefix="!", intents=intents)
+tree = app_commands.CommandTree(bot)
 
+# Slash command
+@tree.command(name="hello", description="Say hello")
+async def hello(interaction: discord.Interaction):
+    await interaction.response.send_message("Hello!")
+
+# Sync commands and confirm bot is ready
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user}")
+    await tree.sync()
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print("------")
 
-@bot.command()
-async def hello(ctx):
-    await ctx.send("Hello! I'm alive 👋")
-
-# Run bot
-bot.run(TOKEN)
+# Run the bot using token from environment variable
+bot.run(os.environ["TOKEN"])
