@@ -1,698 +1,573 @@
+import os
+import re
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-import os
-import json
-import asyncio
-from flask import Flask
-from threading import Thread
 import random
 import aiohttp
-from dotenv import load_dotenv
-import re
+from flask import Flask
+import threading
+import json
+from datetime import datetime
 
-load_dotenv()
-
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-CAT_API_KEY = os.getenv("CAT_API_KEY")  # Optional for cat pics
-
-OWNER_ID = 1319292111325106296
-
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-
-bot = commands.Bot(command_prefix='?', intents=intents)
-tree = bot.tree
-
-# Flask uptime server for Render or Replit
+# --- Flask uptime server ---
 app = Flask('')
 
 @app.route('/')
 def home():
     return "Bot is alive!"
 
-def run():
-    app.run(host="0.0.0.0", port=8080)
+def run_webserver():
+    app.run(host='0.0.0.0', port=8080)
 
 def keep_alive():
-    Thread(target=run).start()
+    t = threading.Thread(target=run_webserver)
+    t.start()
 
-# JSON files for persistent data
-ADMIN_FILE = "admins.json"
-BLACKLIST_FILE = "blacklist.json"
-BAN_FILE = "bans.json"
-LOGS_FILE = "logs.json"
-BLOCKED_WORDS_FILE = "blocked_words.json"
-POOKIE_KEYS_FILE = "pookie_keys.json"
-POOKIE_USERS_FILE = "pookie_users.json"
-CAT_CHANNEL_FILE = "cat_channel.json"
-
-def load_json(file, default):
+# --- JSON helpers ---
+def load_json(filename):
     try:
-        with open(file, "r") as f:
+        with open(filename, 'r') as f:
             return json.load(f)
     except:
-        return default
+        return {}
 
-def save_json(file, data):
-    with open(file, "w") as f:
+def save_json(filename, data):
+    with open(filename, 'w') as f:
         json.dump(data, f, indent=4)
 
-admins = load_json(ADMIN_FILE, [OWNER_ID])
-blacklist = load_json(BLACKLIST_FILE, [])
-banned_users = load_json(BAN_FILE, [])
-logs = load_json(LOGS_FILE, [])
-blocked_words = load_json(BLOCKED_WORDS_FILE, [])
-pookie_keys = load_json(POOKIE_KEYS_FILE, [])
-pookie_users = load_json(POOKIE_USERS_FILE, [])
-cat_channel_data = load_json(CAT_CHANNEL_FILE, {"channel_id": None})
+# --- Persistent storage ---
+admins = load_json('admins.json')
+blacklist = load_json('blacklist.json')
+blocked_words = load_json('blocked_words.json')
+pookie_users = load_json('pookie_users.json')
+pookie_keys = load_json('pookie_keys.json')
+logs = load_json('logs.json')
 
-# -- Utilities --
+OWNER_ID = 1319292111325106296
 
-def is_owner(user_id):
-    return user_id == OWNER_ID
+# Make sure owner is admin
+if str(OWNER_ID) not in admins:
+    admins[str(OWNER_ID)] = True
+    save_json('admins.json', admins)
 
-def is_admin(user_id):
-    return is_owner(user_id) or user_id in admins
+# --- Intents and bot ---
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
 
-def is_pookie(user_id):
-    return user_id in pookie_users or is_owner(user_id)
+bot = commands.Bot(command_prefix='?', intents=intents)
 
-def has_full_access(user_id):
-    # Pookie users have full access
-    return is_pookie(user_id)
+# --- Utility functions ---
+def is_admin(user: discord.User):
+    return admins.get(str(user.id), False) or is_pookie(user)
 
-def is_blacklisted(user_id):
-    return user_id in blacklist
+def is_blacklisted(user: discord.User):
+    return blacklist.get(str(user.id), False)
 
-def is_banned(user_id):
-    return user_id in banned_users
+def is_pookie(user: discord.User):
+    return pookie_users.get(str(user.id), False)
 
-def log_command(user_id, username, command_name, channel_name):
-    logs.append({
-        "user_id": user_id,
-        "username": username,
-        "command": command_name,
-        "channel": channel_name,
-        "timestamp": discord.utils.utcnow().isoformat()
-    })
-    if len(logs) > 1000:
-        logs.pop(0)
-    save_json(LOGS_FILE, logs)
-
-def contains_blocked_word(message_content):
-    # Normalize message: lowercase, remove spaces and common symbols
-    normalized = re.sub(r"[^a-zA-Z0-9]", "", message_content.lower())
+def is_blocked_word(msg_content: str):
+    msg = msg_content.lower()
     for word in blocked_words:
-        w = word.lower()
-        if w in normalized:
+        # Basic bypass check: remove spaces/symbols
+        pattern = re.sub(r'\W+', '', word.lower())
+        check_msg = re.sub(r'\W+', '', msg)
+        if pattern in check_msg:
             return True
     return False
 
-# -- Decorators --
+def add_log(user_id, username, command_name, channel_id, channel_name):
+    entry = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "user_id": user_id,
+        "username": username,
+        "command": command_name,
+        "channel_id": channel_id,
+        "channel_name": channel_name
+    }
+    logs.append(entry)
+    # Keep last 100 logs max
+    if len(logs) > 100:
+        logs.pop(0)
+    save_json('logs.json', logs)
 
+# --- Decorators ---
 def admin_only():
     async def predicate(ctx):
-        if has_full_access(ctx.author.id) or is_admin(ctx.author.id):
+        if is_admin(ctx.author):
             return True
-        else:
-            await ctx.send("You need admin or pookie access to use this command.")
-            return False
-    return commands.check(predicate)
-
-def owner_only():
-    async def predicate(ctx):
-        if is_owner(ctx.author.id):
-            return True
-        else:
-            await ctx.send("Only the owner can use this command.")
-            return False
+        await ctx.send("You need to be an admin to use this command.")
+        return False
     return commands.check(predicate)
 
 def pookie_only():
     async def predicate(ctx):
-        if is_pookie(ctx.author.id):
+        if is_pookie(ctx.author):
             return True
-        else:
-            await ctx.send("Only pookie users can use this command.")
-            return False
+        await ctx.send("You need pookie access to use this command.")
+        return False
     return commands.check(predicate)
 
-# -- Events --
+def not_blacklisted():
+    async def predicate(ctx):
+        if is_blacklisted(ctx.author):
+            await ctx.send("You are blacklisted and cannot use commands.")
+            return False
+        return True
+    return commands.check(predicate)
 
+def admin_only_slash(interaction: discord.Interaction):
+    return is_admin(interaction.user)
+
+def pookie_only_slash(interaction: discord.Interaction):
+    return is_pookie(interaction.user)
+
+def not_blacklisted_slash(interaction: discord.Interaction):
+    return not is_blacklisted(interaction.user)
+
+# --- Events ---
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"Logged in as {bot.user} ({bot.user.id})")
+    keep_alive()
     try:
-        await tree.sync()
+        await bot.tree.sync()
         print("Slash commands synced.")
     except Exception as e:
         print(f"Slash sync error: {e}")
-    # Start daily cat task
-    daily_cat_task.start()
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
-    if is_blacklisted(message.author.id) or is_banned(message.author.id):
-        return
 
-    # Blocked words check
-    if contains_blocked_word(message.content):
+    if is_blacklisted(message.author):
         try:
             await message.delete()
-            await message.channel.send(f"{message.author.mention}, This word is not allowed here.", delete_after=10)
-            return
-        except Exception:
+        except:
             pass
+        return
+
+    # Blocked words detection
+    if is_blocked_word(message.content):
+        try:
+            await message.delete()
+            await message.channel.send(f"{message.author.mention} This word is not allowed here.", delete_after=10)
+        except:
+            pass
+        return
+
     await bot.process_commands(message)
 
-# -- Commands --
+# --- Commands ---
 
-# Prefix and slash commands examples:
-
-@bot.command(name="ping")
+# --- Moderation ---
+@bot.command()
 @admin_only()
-async def ping(ctx):
-    log_command(ctx.author.id, str(ctx.author), "ping", ctx.channel.name)
-    await ctx.send(f"Pong! {round(bot.latency * 1000)}ms")
+async def ban(ctx, member: discord.Member, *, reason=None):
+    await member.ban(reason=reason)
+    await ctx.send(f"{member} was banned. Reason: {reason}")
+    add_log(ctx.author.id, str(ctx.author), "ban", ctx.channel.id, ctx.channel.name)
 
-@tree.command(name="ping", description="Check bot latency")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_ping(interaction: discord.Interaction):
-    if is_blacklisted(interaction.user.id):
-        await interaction.response.send_message("You are blacklisted.", ephemeral=True)
-        return
-    log_command(interaction.user.id, str(interaction.user), "ping", interaction.channel.name)
-    await interaction.response.send_message(f"Pong! {round(bot.latency * 1000)}ms")
-
-@bot.command(name="pong")
-async def pong(ctx):
-    log_command(ctx.author.id, str(ctx.author), "pong", ctx.channel.name)
-    await ctx.send("Ping!")
-
-@tree.command(name="pong", description="Respond with ping")
-async def slash_pong(interaction: discord.Interaction):
-    if is_blacklisted(interaction.user.id):
-        await interaction.response.send_message("You are blacklisted.", ephemeral=True)
-        return
-    log_command(interaction.user.id, str(interaction.user), "pong", interaction.channel.name)
-    await interaction.response.send_message("Ping!")
-
-@bot.command(name="cat")
-async def cat(ctx):
-    log_command(ctx.author.id, str(ctx.author), "cat", ctx.channel.name)
-    headers = {}
-    if CAT_API_KEY:
-        headers["x-api-key"] = CAT_API_KEY
-    url = "https://api.thecatapi.com/v1/images/search"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                await ctx.send(data[0]["url"])
-            else:
-                await ctx.send("Couldn't fetch a cat image right now.")
-
-@tree.command(name="cat", description="Send a random cat image")
-async def slash_cat(interaction: discord.Interaction):
-    if is_blacklisted(interaction.user.id):
-        await interaction.response.send_message("You are blacklisted.", ephemeral=True)
-        return
-    log_command(interaction.user.id, str(interaction.user), "cat", interaction.channel.name)
-    headers = {}
-    if CAT_API_KEY:
-        headers["x-api-key"] = CAT_API_KEY
-    url = "https://api.thecatapi.com/v1/images/search"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                await interaction.response.send_message(data[0]["url"])
-            else:
-                await interaction.response.send_message("Couldn't fetch a cat image right now.")
-
-@bot.command(name="8ball")
-async def eightball(ctx, *, question: str):
-    log_command(ctx.author.id, str(ctx.author), "8ball", ctx.channel.name)
-    responses = [
-        "It is certain.", "Without a doubt.", "You may rely on it.",
-        "Ask again later.", "Better not tell you now.", "My reply is no.",
-        "Very doubtful."
-    ]
-    await ctx.send(f"🎱 Question: {question}\nAnswer: {random.choice(responses)}")
-
-@tree.command(name="8ball", description="Ask the magic 8ball a question")
-@app_commands.describe(question="Your question")
-async def slash_eightball(interaction: discord.Interaction, question: str):
-    log_command(interaction.user.id, str(interaction.user), "8ball", interaction.channel.name)
-    responses = [
-        "It is certain.", "Without a doubt.", "You may rely on it.",
-        "Ask again later.", "Better not tell you now.", "My reply is no.",
-        "Very doubtful."
-    ]
-    await interaction.response.send_message(f"🎱 Question: {question}\nAnswer: {random.choice(responses)}")
-
-@bot.command(name="joke")
-async def joke(ctx):
-    log_command(ctx.author.id, str(ctx.author), "joke", ctx.channel.name)
-    jokes = [
-        "Why don't scientists trust atoms? Because they make up everything!",
-        "Why did the bicycle fall over? Because it was two-tired!",
-        "I told my computer I needed a break, and it said no problem—it would go to sleep.",
-        "Why do programmers prefer dark mode? Because light attracts bugs!",
-        "What do you call fake spaghetti? An impasta!"
-    ]
-    await ctx.send(random.choice(jokes))
-
-@tree.command(name="joke", description="Tell a random joke")
-async def slash_joke(interaction: discord.Interaction):
-    log_command(interaction.user.id, str(interaction.user), "joke", interaction.channel.name)
-    jokes = [
-        "Why don't scientists trust atoms? Because they make up everything!",
-        "Why did the bicycle fall over? Because it was two-tired!",
-        "I told my computer I needed a break, and it said no problem—it would go to sleep.",
-        "Why do programmers prefer dark mode? Because light attracts bugs!",
-        "What do you call fake spaghetti? An impasta!"
-    ]
-    await interaction.response.send_message(random.choice(jokes))
-
-@bot.command(name="dadjoke")
-async def dadjoke(ctx):
-    log_command(ctx.author.id, str(ctx.author), "dadjoke", ctx.channel.name)
-    jokes = [
-        "I'm reading a book about anti-gravity. It's impossible to put down!",
-        "Why don't skeletons fight each other? They don't have the guts.",
-        "I would avoid the sushi if I was you. It’s a little fishy."
-    ]
-    await ctx.send(random.choice(jokes))
-
-@tree.command(name="dadjoke", description="Tell a dad joke")
-async def slash_dadjoke(interaction: discord.Interaction):
-    log_command(interaction.user.id, str(interaction.user), "dadjoke", interaction.channel.name)
-    jokes = [
-        "I'm reading a book about anti-gravity. It's impossible to put down!",
-        "Why don't skeletons fight each other? They don't have the guts.",
-        "I would avoid the sushi if I was you. It’s a little fishy."
-    ]
-    await interaction.response.send_message(random.choice(jokes))
-
-@bot.command(name="roll")
-async def roll(ctx, sides: int = 6):
-    if sides < 2:
-        await ctx.send("You need at least 2 sides to roll a dice!")
-        return
-    result = random.randint(1, sides)
-    log_command(ctx.author.id, str(ctx.author), "roll", ctx.channel.name)
-    await ctx.send(f"🎲 You rolled a {result} on a {sides}-sided dice.")
-
-@tree.command(name="roll", description="Roll a dice")
-@app_commands.describe(sides="Number of sides")
-async def slash_roll(interaction: discord.Interaction, sides: int = 6):
-    if sides < 2:
-        await interaction.response.send_message("You need at least 2 sides to roll a dice!")
-        return
-    result = random.randint(1, sides)
-    log_command(interaction.user.id, str(interaction.user), "roll", interaction.channel.name)
-    await interaction.response.send_message(f"🎲 You rolled a {result} on a {sides}-sided dice.")
-
-@bot.command(name="flip")
-async def flip(ctx):
-    result = random.choice(["Heads", "Tails"])
-    log_command(ctx.author.id, str(ctx.author), "flip", ctx.channel.name)
-    await ctx.send(f"🪙 It's {result}!")
-
-@tree.command(name="flip", description="Flip a coin")
-async def slash_flip(interaction: discord.Interaction):
-    result = random.choice(["Heads", "Tails"])
-    log_command(interaction.user.id, str(interaction.user), "flip", interaction.channel.name)
-    await interaction.response.send_message(f"🪙 It's {result}!")
-
-@bot.command(name="rps")
-async def rps(ctx, choice: str):
-    choices = ["rock", "paper", "scissors"]
-    user_choice = choice.lower()
-    if user_choice not in choices:
-        await ctx.send("Please choose rock, paper, or scissors.")
-        return
-    bot_choice = random.choice(choices)
-    if user_choice == bot_choice:
-        result = "It's a tie!"
-    elif (user_choice == "rock" and bot_choice == "scissors") or \
-         (user_choice == "paper" and bot_choice == "rock") or \
-         (user_choice == "scissors" and bot_choice == "paper"):
-        result = "You win!"
-    else:
-        result = "You lose!"
-    log_command(ctx.author.id, str(ctx.author), "rps", ctx.channel.name)
-    await ctx.send(f"You chose **{user_choice}**. I chose **{bot_choice}**. {result}")
-
-@tree.command(name="rps", description="Play rock paper scissors")
-@app_commands.describe(choice="Your choice: rock, paper, or scissors")
-async def slash_rps(interaction: discord.Interaction, choice: str):
-    choices = ["rock", "paper", "scissors"]
-    user_choice = choice.lower()
-    if user_choice not in choices:
-        await interaction.response.send_message("Please choose rock, paper, or scissors.")
-        return
-    bot_choice = random.choice(choices)
-    if user_choice == bot_choice:
-        result = "It's a tie!"
-    elif (user_choice == "rock" and bot_choice == "scissors") or \
-         (user_choice == "paper" and bot_choice == "rock") or \
-         (user_choice == "scissors" and bot_choice == "paper"):
-        result = "You win!"
-    else:
-        result = "You lose!"
-    log_command(interaction.user.id, str(interaction.user), "rps", interaction.channel.name)
-    await interaction.response.send_message(f"You chose **{user_choice}**. I chose **{bot_choice}**. {result}")
-
-# Say commands
-
-@bot.command(name="say")
-async def say(ctx, *, text):
-    if is_blacklisted(ctx.author.id):
-        return
-    # Remove mentions for normal say
-    text = re.sub(r"<@!?&?\d+>", "[ping blocked]", text)
-    log_command(ctx.author.id, str(ctx.author), "say", ctx.channel.name)
-    await ctx.send(text)
-
-@bot.command(name="say_admin")
-@owner_only()
-async def say_admin(ctx, *, text):
-    log_command(ctx.author.id, str(ctx.author), "say_admin", ctx.channel.name)
-    await ctx.send(text)
-
-# User info and avatar
-
-@bot.command(name="userinfo")
-async def userinfo(ctx, user: discord.User = None):
-    user = user or ctx.author
-    embed = discord.Embed(title=f"User Info - {user}", color=discord.Color.green())
-    embed.set_thumbnail(url=user.avatar.url if user.avatar else user.default_avatar.url)
-    embed.add_field(name="ID", value=user.id)
-    embed.add_field(name="Bot?", value=user.bot)
-    embed.add_field(name="Created at", value=user.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"))
-    if isinstance(ctx.channel, discord.TextChannel):
-        member = ctx.guild.get_member(user.id)
-        if member:
-            embed.add_field(name="Joined server at", value=member.joined_at.strftime("%Y-%m-%d %H:%M:%S UTC"))
-    await ctx.send(embed=embed)
-
-@tree.command(name="userinfo", description="Get info about a user")
-@app_commands.describe(user="The user to get info about")
-async def slash_userinfo(interaction: discord.Interaction, user: discord.User = None):
-    user = user or interaction.user
-    embed = discord.Embed(title=f"User Info - {user}", color=discord.Color.green())
-    embed.set_thumbnail(url=user.avatar.url if user.avatar else user.default_avatar.url)
-    embed.add_field(name="ID", value=user.id)
-    embed.add_field(name="Bot?", value=user.bot)
-    embed.add_field(name="Created at", value=user.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"))
-    guild = interaction.guild
-    member = guild.get_member(user.id) if guild else None
-    if member:
-        embed.add_field(name="Joined server at", value=member.joined_at.strftime("%Y-%m-%d %H:%M:%S UTC"))
-    await interaction.response.send_message(embed=embed)
-
-@bot.command(name="avatar")
-async def avatar(ctx, user: discord.User = None):
-    user = user or ctx.author
-    embed = discord.Embed(title=f"{user}'s avatar")
-    embed.set_image(url=user.avatar.url if user.avatar else user.default_avatar.url)
-    await ctx.send(embed=embed)
-
-@tree.command(name="avatar", description="Get a user's avatar")
-@app_commands.describe(user="User to get avatar")
-async def slash_avatar(interaction: discord.Interaction, user: discord.User = None):
-    user = user or interaction.user
-    embed = discord.Embed(title=f"{user}'s avatar")
-    embed.set_image(url=user.avatar.url if user.avatar else user.default_avatar.url)
-    await interaction.response.send_message(embed=embed)
-
-# Admin only commands
-
-@bot.command(name="blacklist")
-@owner_only()
-async def blacklist_add(ctx, user: discord.User):
-    if user.id in blacklist:
-        await ctx.send("User is already blacklisted.")
-        return
-    blacklist.append(user.id)
-    save_json(BLACKLIST_FILE, blacklist)
-    await ctx.send(f"User {user} added to blacklist.")
-
-@bot.command(name="unblacklist")
-@owner_only()
-async def unblacklist(ctx, user: discord.User):
-    if user.id not in blacklist:
-        await ctx.send("User is not blacklisted.")
-        return
-    blacklist.remove(user.id)
-    save_json(BLACKLIST_FILE, blacklist)
-    await ctx.send(f"User {user} removed from blacklist.")
-
-@bot.command(name="ban")
-@owner_only()
-async def ban(ctx, user: discord.User, *, reason=None):
-    if user.id in banned_users:
-        await ctx.send("User is already banned.")
-        return
-    banned_users.append(user.id)
-    save_json(BAN_FILE, banned_users)
-    await ctx.guild.ban(user, reason=reason)
-    await ctx.send(f"{user} has been banned. Reason: {reason}")
-
-@bot.command(name="unban")
-@owner_only()
-async def unban(ctx, user: discord.User):
-    if user.id not in banned_users:
-        await ctx.send("User is not banned.")
-        return
-    banned_users.remove(user.id)
-    save_json(BAN_FILE, banned_users)
+@bot.command()
+@admin_only()
+async def unban(ctx, user_id: int):
+    user = await bot.fetch_user(user_id)
     await ctx.guild.unban(user)
-    await ctx.send(f"{user} has been unbanned.")
+    await ctx.send(f"{user} was unbanned.")
+    add_log(ctx.author.id, str(ctx.author), "unban", ctx.channel.id, ctx.channel.name)
 
-@bot.command(name="addadmin")
-@owner_only()
-async def addadmin(ctx, user: discord.User):
-    if user.id in admins:
-        await ctx.send("User is already an admin.")
-        return
-    admins.append(user.id)
-    save_json(ADMIN_FILE, admins)
-    await ctx.send(f"User {user} added as admin.")
-
-@bot.command(name="removeadmin")
-@owner_only()
-async def removeadmin(ctx, user: discord.User):
-    if user.id not in admins:
-        await ctx.send("User is not an admin.")
-        return
-    admins.remove(user.id)
-    save_json(ADMIN_FILE, admins)
-    await ctx.send(f"User {user} removed from admins.")
-
-@bot.command(name="showadmins")
+@bot.command()
 @admin_only()
-async def showadmins(ctx):
-    if not admins:
-        await ctx.send("No admins set.")
-        return
-    mentions = []
-    for aid in admins:
-        member = ctx.guild.get_member(aid)
-        if member:
-            mentions.append(str(member))
-        else:
-            mentions.append(f"User ID: {aid}")
-    await ctx.send("Admins:\n" + "\n".join(mentions))
+async def kick(ctx, member: discord.Member, *, reason=None):
+    await member.kick(reason=reason)
+    await ctx.send(f"{member} was kicked. Reason: {reason}")
+    add_log(ctx.author.id, str(ctx.author), "kick", ctx.channel.id, ctx.channel.name)
 
-@bot.command(name="addblockedword")
-@owner_only()
-async def addblockedword(ctx, *, word):
+@bot.command()
+@admin_only()
+async def blacklist(ctx, user: discord.User):
+    blacklist[str(user.id)] = True
+    save_json('blacklist.json', blacklist)
+    await ctx.send(f"{user} added to blacklist.")
+    add_log(ctx.author.id, str(ctx.author), "blacklist", ctx.channel.id, ctx.channel.name)
+
+@bot.command()
+@admin_only()
+async def unblacklist(ctx, user: discord.User):
+    if str(user.id) in blacklist:
+        blacklist.pop(str(user.id))
+        save_json('blacklist.json', blacklist)
+        await ctx.send(f"{user} removed from blacklist.")
+        add_log(ctx.author.id, str(ctx.author), "unblacklist", ctx.channel.id, ctx.channel.name)
+    else:
+        await ctx.send(f"{user} is not blacklisted.")
+
+@bot.command()
+@admin_only()
+async def show_blacklist(ctx):
+    if not blacklist:
+        await ctx.send("Blacklist is empty.")
+        return
+    users = []
+    for uid in blacklist:
+        user = await bot.fetch_user(int(uid))
+        users.append(f"{user} ({uid})")
+    await ctx.send("Blacklisted users:\n" + "\n".join(users))
+
+@bot.command()
+@admin_only()
+async def add_admin(ctx, user: discord.User):
+    admins[str(user.id)] = True
+    save_json('admins.json', admins)
+    await ctx.send(f"{user} added as admin.")
+    add_log(ctx.author.id, str(ctx.author), "add_admin", ctx.channel.id, ctx.channel.name)
+
+@bot.command()
+@admin_only()
+async def remove_admin(ctx, user: discord.User):
+    if str(user.id) == str(OWNER_ID):
+        await ctx.send("Cannot remove owner from admin.")
+        return
+    if str(user.id) in admins:
+        admins.pop(str(user.id))
+        save_json('admins.json', admins)
+        await ctx.send(f"{user} removed from admin.")
+        add_log(ctx.author.id, str(ctx.author), "remove_admin", ctx.channel.id, ctx.channel.name)
+    else:
+        await ctx.send(f"{user} is not an admin.")
+
+@bot.command()
+@admin_only()
+async def show_admins(ctx):
+    users = []
+    for uid in admins:
+        user = await bot.fetch_user(int(uid))
+        users.append(f"{user} ({uid})")
+    await ctx.send("Admins:\n" + "\n".join(users))
+
+# --- Blocked words management ---
+@bot.command()
+@admin_only()
+async def add_blocked_word(ctx, *, word: str):
     word = word.lower().strip()
     if word in blocked_words:
-        await ctx.send("That word is already blocked.")
+        await ctx.send("Word already in blocked list.")
         return
     blocked_words.append(word)
-    save_json(BLOCKED_WORDS_FILE, blocked_words)
-    await ctx.send(f"Blocked word added: {word}")
+    save_json('blocked_words.json', blocked_words)
+    await ctx.send(f"Added blocked word: {word}")
 
-@bot.command(name="removeblockedword")
-@owner_only()
-async def removeblockedword(ctx, *, word):
+@bot.command()
+@admin_only()
+async def remove_blocked_word(ctx, *, word: str):
     word = word.lower().strip()
     if word not in blocked_words:
-        await ctx.send("That word is not blocked.")
+        await ctx.send("Word not found in blocked list.")
         return
     blocked_words.remove(word)
-    save_json(BLOCKED_WORDS_FILE, blocked_words)
-    await ctx.send(f"Blocked word removed: {word}")
+    save_json('blocked_words.json', blocked_words)
+    await ctx.send(f"Removed blocked word: {word}")
 
-@bot.command(name="showblockedwords")
-@owner_only()
-async def showblockedwords(ctx):
+@bot.command()
+@admin_only()
+async def show_blocked_words(ctx):
     if not blocked_words:
-        await ctx.send("No blocked words set.")
+        await ctx.send("No blocked words.")
         return
     await ctx.send("Blocked words:\n" + ", ".join(blocked_words))
 
-@bot.command(name="logs")
-@admin_only()
-async def show_logs(ctx, limit: int = 10):
-    last_logs = logs[-limit:]
-    if not last_logs:
-        await ctx.send("No logs available.")
-        return
-    embed = discord.Embed(title=f"Last {limit} Command Logs", color=discord.Color.blue())
-    for log in last_logs:
-        embed.add_field(
-            name=f"{log['username']} used {log['command']}",
-            value=f"Channel: {log['channel']} at {log['timestamp']}",
-            inline=False)
-    await ctx.send(embed=embed)
-
-# -- Pookie system --
-
-@bot.command(name="createpookiekey")
-@owner_only()
+# --- Pookie system ---
+@bot.command()
+@commands.check(lambda ctx: ctx.author.id == OWNER_ID)
 async def create_pookie_key(ctx):
-    key = ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=8))
-    pookie_keys.append(key)
-    save_json(POOKIE_KEYS_FILE, pookie_keys)
-    await ctx.send(f"Pookie key created: `{key}` (One-time use)")
+    key = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=12))
+    pookie_keys[key] = True
+    save_json('pookie_keys.json', pookie_keys)
+    await ctx.send(f"New pookie key created:\n`{key}`")
 
-@bot.command(name="deletepookiekey")
-@owner_only()
+@bot.command()
+@commands.check(lambda ctx: ctx.author.id == OWNER_ID)
 async def delete_pookie_key(ctx, key: str):
-    key = key.upper()
-    if key not in pookie_keys:
-        await ctx.send("That key does not exist.")
-        return
-    pookie_keys.remove(key)
-    save_json(POOKIE_KEYS_FILE, pookie_keys)
-    await ctx.send(f"Pookie key `{key}` deleted.")
+    if key in pookie_keys:
+        pookie_keys.pop(key)
+        save_json('pookie_keys.json', pookie_keys)
+        await ctx.send(f"Pookie key `{key}` deleted.")
+    else:
+        await ctx.send(f"No such pookie key: `{key}`")
 
-@bot.command(name="listpookiekeys")
-@owner_only()
-async def list_pookie_keys(ctx):
-    if not pookie_keys:
-        await ctx.send("No pookie keys exist.")
-        return
-    await ctx.send("Pookie keys:\n" + ", ".join(pookie_keys))
-
-@bot.command(name="redeempookie")
-async def redeem_pookie(ctx, key: str):
-    key = key.upper()
-    if key not in pookie_keys:
-        await ctx.send("Invalid pookie key.")
-        return
-    if ctx.author.id in pookie_users:
-        await ctx.send("You already have pookie access.")
-        return
-    pookie_users.append(ctx.author.id)
-    pookie_keys.remove(key)
-    save_json(POOKIE_USERS_FILE, pookie_users)
-    save_json(POOKIE_KEYS_FILE, pookie_keys)
-    await ctx.send(f"Congrats {ctx.author.mention}, you now have full pookie access!")
-
-@bot.command(name="removepookieuser")
-@owner_only()
-async def remove_pookie_user(ctx, user: discord.User):
-    if user.id not in pookie_users:
-        await ctx.send("User is not a pookie user.")
-        return
-    pookie_users.remove(user.id)
-    save_json(POOKIE_USERS_FILE, pookie_users)
-    await ctx.send(f"Pookie access removed from {user}.")
-
-@bot.command(name="listpookieusers")
-@owner_only()
+@bot.command()
+@commands.check(lambda ctx: ctx.author.id == OWNER_ID)
 async def list_pookie_users(ctx):
     if not pookie_users:
         await ctx.send("No pookie users.")
         return
-    mentions = []
+    users = []
     for uid in pookie_users:
-        member = ctx.guild.get_member(uid)
-        if member:
-            mentions.append(str(member))
-        else:
-            mentions.append(f"User ID: {uid}")
-    await ctx.send("Pookie users:\n" + "\n".join(mentions))
+        user = await bot.fetch_user(int(uid))
+        users.append(f"{user} ({uid})")
+    await ctx.send("Pookie users:\n" + "\n".join(users))
 
-# Showcommands: list commands visible to user
-
-@tree.command(name="showcommands", description="Show commands you can use")
-async def slash_showcommands(interaction: discord.Interaction):
-    user = interaction.user
-    cmds = []
-
-    # Public commands:
-    public_cmds = [
-        "/pong", "/cat", "/8ball", "/joke", "/dadjoke", "/roll", "/flip", "/rps",
-        "/userinfo", "/avatar", "/redeempookie",
-        "?pong", "?cat", "?8ball", "?joke", "?dadjoke", "?roll", "?flip", "?rps",
-        "?userinfo", "?avatar", "?redeempookie", "?say"
-    ]
-
-    # Admin-only commands
-    admin_cmds = [
-        "?ping", "?blacklist", "?unblacklist", "?ban", "?unban", "?addadmin", "?removeadmin",
-        "?showadmins", "?addblockedword", "?removeblockedword", "?showblockedwords", "?logs",
-        "?say_admin",
-        "?createpookiekey", "?deletepookiekey", "?listpookiekeys",
-        "?removepookieuser", "?listpookieusers"
-    ]
-
-    if is_owner(user.id) or is_pookie(user.id):
-        cmds.extend(public_cmds + admin_cmds)
-    elif is_admin(user.id):
-        cmds.extend(public_cmds + admin_cmds)
+@bot.command()
+@commands.check(lambda ctx: ctx.author.id == OWNER_ID)
+async def remove_pookie_user(ctx, user: discord.User):
+    if str(user.id) in pookie_users:
+        pookie_users.pop(str(user.id))
+        save_json('pookie_users.json', pookie_users)
+        await ctx.send(f"{user} removed from pookie users.")
     else:
-        cmds.extend(public_cmds)
+        await ctx.send(f"{user} is not a pookie user.")
 
-    await interaction.response.send_message("Commands you can use:\n" + "\n".join(cmds), ephemeral=True)
+@bot.command()
+@not_blacklisted()
+async def redeem_pookie(ctx, key: str):
+    if key in pookie_keys:
+        pookie_users[str(ctx.author.id)] = True
+        pookie_keys.pop(key)
+        save_json('pookie_users.json', pookie_users)
+        save_json('pookie_keys.json', pookie_keys)
+        await ctx.send(f"{ctx.author.mention} You have been granted pookie access!")
+    else:
+        await ctx.send("Invalid or already used pookie key.")
 
-# -- Daily cat image posting to specific channel --
+# --- Fun commands ---
 
-@tasks.loop(hours=24)
-async def daily_cat_task():
-    channel_id = cat_channel_data.get("channel_id")
-    if not channel_id:
+eight_ball_answers = [
+    "It is certain.", "It is decidedly so.", "Without a doubt.", "Yes – definitely.",
+    "You may rely on it.", "As I see it, yes.", "Most likely.", "Outlook good.",
+    "Yes.", "Signs point to yes.", "Reply hazy, try again.", "Ask again later.",
+    "Better not tell you now.", "Cannot predict now.", "Concentrate and ask again.",
+    "Don't count on it.", "My reply is no.", "My sources say no.",
+    "Outlook not so good.", "Very doubtful."
+]
+
+jokes = [
+    "Why did the scarecrow win an award? Because he was outstanding in his field!",
+    "Why don't scientists trust atoms? Because they make up everything!",
+    "I told my wife she was drawing her eyebrows too high. She looked surprised.",
+    "Why did the math book look sad? Because it had too many problems."
+]
+
+dad_jokes = [
+    "I'm reading a book about anti-gravity. It's impossible to put down!",
+    "Did you hear about the restaurant on the moon? Great food, no atmosphere.",
+    "I would avoid the sushi if I was you. It’s a little fishy.",
+    "Want to hear a joke about construction? I'm still working on it."
+]
+
+rps_choices = ["rock", "paper", "scissors"]
+
+@bot.command()
+@not_blacklisted()
+async def eightball(ctx, *, question: str):
+    answer = random.choice(eight_ball_answers)
+    await ctx.send(f"🎱 Question: {question}\nAnswer: {answer}")
+    add_log(ctx.author.id, str(ctx.author), "8ball", ctx.channel.id, ctx.channel.name)
+
+@bot.command()
+@not_blacklisted()
+async def joke(ctx):
+    await ctx.send(random.choice(jokes))
+    add_log(ctx.author.id, str(ctx.author), "joke", ctx.channel.id, ctx.channel.name)
+
+@bot.command()
+@not_blacklisted()
+async def dadjoke(ctx):
+    await ctx.send(random.choice(dad_jokes))
+    add_log(ctx.author.id, str(ctx.author), "dadjoke", ctx.channel.id, ctx.channel.name)
+
+@bot.command()
+@not_blacklisted()
+async def rps(ctx, choice: str):
+    choice = choice.lower()
+    if choice not in rps_choices:
+        await ctx.send("Choose rock, paper, or scissors.")
         return
-    channel = bot.get_channel(channel_id)
-    if not channel:
+    bot_choice = random.choice(rps_choices)
+    if choice == bot_choice:
+        result = "It's a tie!"
+    elif (choice == "rock" and bot_choice == "scissors") or \
+         (choice == "paper" and bot_choice == "rock") or \
+         (choice == "scissors" and bot_choice == "paper"):
+        result = "You win!"
+    else:
+        result = "I win!"
+    await ctx.send(f"You chose {choice}, I chose {bot_choice}. {result}")
+    add_log(ctx.author.id, str(ctx.author), "rps", ctx.channel.id, ctx.channel.name)
+
+@bot.command()
+@not_blacklisted()
+async def flipcoin(ctx):
+    result = random.choice(["Heads", "Tails"])
+    await ctx.send(f"The coin landed on {result}.")
+    add_log(ctx.author.id, str(ctx.author), "flipcoin", ctx.channel.id, ctx.channel.name)
+
+@bot.command()
+@not_blacklisted()
+async def rolldice(ctx, sides: int = 6):
+    if sides < 2 or sides > 100:
+        await ctx.send("Number of sides must be between 2 and 100.")
         return
+    result = random.randint(1, sides)
+    await ctx.send(f"🎲 Rolled a {sides}-sided dice: {result}")
+    add_log(ctx.author.id, str(ctx.author), "rolldice", ctx.channel.id, ctx.channel.name)
+
+@bot.command()
+@not_blacklisted()
+async def cat(ctx):
+    cat_api_key = os.getenv("CAT_API_KEY")
     headers = {}
-    if CAT_API_KEY:
-        headers["x-api-key"] = CAT_API_KEY
-    url = "https://api.thecatapi.com/v1/images/search"
+    if cat_api_key:
+        headers["x-api-key"] = cat_api_key
+    url = "https://api.thecatapi.com/v1/images/search?limit=1"
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                await channel.send(data[0]["url"])
+            data = await resp.json()
+            if not data:
+                await ctx.send("Could not get a cat image.")
+                return
+            await ctx.send(data[0]["url"])
+    add_log(ctx.author.id, str(ctx.author), "cat", ctx.channel.id, ctx.channel.name)
 
-@bot.command(name="setcatchannel")
-@owner_only()
-async def set_cat_channel(ctx, channel: discord.TextChannel):
-    cat_channel_data["channel_id"] = channel.id
-    save_json(CAT_CHANNEL_FILE, cat_channel_data)
-    await ctx.send(f"Daily cat channel set to {channel.mention}")
+# --- Say commands ---
+@bot.command()
+@not_blacklisted()
+async def say(ctx, *, message: str):
+    # Remove pings
+    safe_msg = message.replace('@everyone', '@\u200beveryone').replace('@here', '@\u200bhere')
+    await ctx.message.delete()
+    await ctx.send(safe_msg)
+    add_log(ctx.author.id, str(ctx.author), "say", ctx.channel.id, ctx.channel.name)
 
-@bot.command(name="removecatchannel")
-@owner_only()
-async def remove_cat_channel(ctx):
-    cat_channel_data["channel_id"] = None
-    save_json(CAT_CHANNEL_FILE, cat_channel_data)
-    await ctx.send("Daily cat channel removed.")
+@bot.command()
+@admin_only()
+async def say_admin(ctx, *, message: str):
+    await ctx.message.delete()
+    await ctx.send(message)
+    add_log(ctx.author.id, str(ctx.author), "say_admin", ctx.channel.id, ctx.channel.name)
 
-# -- Run bot --
+# --- User info & avatar ---
+@bot.command()
+@not_blacklisted()
+async def avatar(ctx, user: discord.User = None):
+    user = user or ctx.author
+    await ctx.send(user.avatar.url)
+    add_log(ctx.author.id, str(ctx.author), "avatar", ctx.channel.id, ctx.channel.name)
 
-keep_alive()
+@bot.command()
+@not_blacklisted()
+async def userinfo(ctx, user: discord.User = None):
+    user = user or ctx.author
+    embed = discord.Embed(title=f"{user}", description=f"ID: {user.id}", color=0x00ff00)
+    embed.set_thumbnail(url=user.avatar.url)
+    embed.add_field(name="Account Created", value=user.created_at.strftime("%Y-%m-%d"))
+    member = ctx.guild.get_member(user.id) if ctx.guild else None
+    if member:
+        embed.add_field(name="Joined Server", value=member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "Unknown")
+    await ctx.send(embed=embed)
+    add_log(ctx.author.id, str(ctx.author), "userinfo", ctx.channel.id, ctx.channel.name)
+
+# --- Show commands based on role ---
+@bot.command()
+async def showcommands(ctx):
+    user = ctx.author
+    available_cmds = []
+    for command in bot.commands:
+        # Check blacklist
+        if is_blacklisted(user):
+            continue
+        # Check admin only commands
+        if getattr(command.callback, "commands_only_admin", False) and not is_admin(user):
+            continue
+        # Check pookie only commands
+        if getattr(command.callback, "commands_only_pookie", False) and not is_pookie(user):
+            continue
+        available_cmds.append(f"?{command.name}")
+    await ctx.send("Commands you can use:\n" + "\n".join(sorted(available_cmds)))
+
+# --- Slash Commands Setup ---
+@bot.event
+async def on_ready():
+    # Sync slash commands each ready
+    await bot.tree.sync()
+
+def slash_admin_only():
+    async def predicate(interaction: discord.Interaction):
+        if is_admin(interaction.user):
+            return True
+        await interaction.response.send_message("Admin only command.", ephemeral=True)
+        return False
+    return app_commands.check(predicate)
+
+def slash_pookie_only():
+    async def predicate(interaction: discord.Interaction):
+        if is_pookie(interaction.user):
+            return True
+        await interaction.response.send_message("Pookie only command.", ephemeral=True)
+        return False
+    return app_commands.check(predicate)
+
+def slash_not_blacklisted():
+    async def predicate(interaction: discord.Interaction):
+        if not is_blacklisted(interaction.user):
+            return True
+        await interaction.response.send_message("You are blacklisted.", ephemeral=True)
+        return False
+    return app_commands.check(predicate)
+
+@bot.tree.command(name="ping", description="Ping the bot")
+@slash_admin_only()
+async def ping_slash(interaction: discord.Interaction):
+    await interaction.response.send_message("Pong!")
+
+@bot.tree.command(name="pong", description="Pong command")
+@slash_not_blacklisted()
+async def pong_slash(interaction: discord.Interaction):
+    await interaction.response.send_message("Ping!")
+
+@bot.tree.command(name="avatar", description="Get user avatar")
+@slash_not_blacklisted()
+@app_commands.describe(user="User to get avatar of")
+async def avatar_slash(interaction: discord.Interaction, user: discord.User = None):
+    user = user or interaction.user
+    await interaction.response.send_message(user.avatar.url)
+
+@bot.tree.command(name="userinfo", description="Get user info")
+@slash_not_blacklisted()
+@app_commands.describe(user="User to get info of")
+async def userinfo_slash(interaction: discord.Interaction, user: discord.User = None):
+    user = user or interaction.user
+    embed = discord.Embed(title=f"{user}", description=f"ID: {user.id}", color=0x00ff00)
+    embed.set_thumbnail(url=user.avatar.url)
+    guild = interaction.guild
+    if guild:
+        member = guild.get_member(user.id)
+        if member:
+            embed.add_field(name="Joined Server", value=member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "Unknown")
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="say", description="Say something without pings")
+@slash_not_blacklisted()
+@app_commands.describe(message="Message to say")
+async def say_slash(interaction: discord.Interaction, message: str):
+    safe_msg = message.replace('@everyone', '@\u200beveryone').replace('@here', '@\u200bhere')
+    await interaction.response.send_message(safe_msg)
+
+@bot.tree.command(name="say_admin", description="Admin say with pings allowed")
+@slash_admin_only()
+@app_commands.describe(message="Message to say")
+async def say_admin_slash(interaction: discord.Interaction, message: str):
+    await interaction.response.send_message(message)
+
+# (Add other slash fun commands similar to prefix if you want...)
+
+# --- Main ---
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+if not TOKEN:
+    print("Error: DISCORD_TOKEN missing in environment variables!")
+    exit(1)
+
 bot.run(TOKEN)
