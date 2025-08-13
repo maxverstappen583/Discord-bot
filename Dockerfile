@@ -1,20 +1,25 @@
-# Use official Python runtime as a parent image
+# Base image: official Python slim
 FROM python:3.11-slim
 
-# Set working directory inside the container
+# Set working directory
 WORKDIR /app
 
-# Copy requirements first to leverage Docker cache
-COPY requirements.txt .
+# Copy all files
+COPY . /app
 
-# Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Upgrade pip and install dependencies
+RUN pip install --upgrade pip
+RUN pip install -r requirements.txt
 
-# Copy the rest of your bot's code
-COPY . .
+# Set environment variables for Render
+ENV PYTHONUNBUFFERED=1
+ENV DISCORD_BOT_TOKEN=your_token_here
 
-# Expose port 8080 for Render health checks (if you have a web server)
+# Expose Flask port
 EXPOSE 8080
 
-# Run your bot
+# Healthcheck (optional for Render)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD curl -f http://localhost:8080/ || exit 1
+
+# Run the bot
 CMD ["python", "main.py"]
