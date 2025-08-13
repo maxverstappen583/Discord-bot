@@ -1,7 +1,6 @@
 import discord
 from discord.ext import commands, tasks
-from discord import app_commands, ButtonStyle
-from discord.ui import Button, View
+from discord import app_commands
 import json, random, asyncio, os, datetime, aiohttp, threading
 from flask import Flask
 
@@ -15,6 +14,7 @@ def home():
     return "Bot is alive!"
 
 def run_flask():
+    print("[Flask] Starting Flask server for keep-alive on port 8080...")
     app.run(host='0.0.0.0', port=8080)
 
 threading.Thread(target=run_flask).start()
@@ -23,6 +23,12 @@ threading.Thread(target=run_flask).start()
 # LOAD ENV & DATA
 # -------------------------------
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
+if not TOKEN:
+    print("[ERROR] DISCORD_BOT_TOKEN not found in environment variables!")
+    exit(1)
+else:
+    print("[INFO] Discord token loaded.")
+
 DATA_FILE = "data.json"
 
 if not os.path.exists(DATA_FILE):
@@ -54,9 +60,6 @@ tree = bot.tree
 
 OWNER_ID = 1319292111325106296  # Replace with your ID
 
-# -------------------------------
-# HELPER FUNCTIONS
-# -------------------------------
 def is_admin(user_id):
     return user_id == OWNER_ID or user_id in data["admins"] or user_id in data["pookie_users"]
 
@@ -65,21 +68,22 @@ def log_command(user, command, channel):
         "user": user.id,
         "name": user.name,
         "command": command,
-        "channel": channel.name,
+        "channel": getattr(channel, "name", "DM"),
         "time": datetime.datetime.utcnow().isoformat()
     }
     data["logs"].append(entry)
     save_data()
+    print(f"[LOG] {user} used command: {command} in {getattr(channel, 'name', 'DM')}")
 
 # -------------------------------
 # EVENTS
 # -------------------------------
-snipes = {}  # channel_id: (author, content, time)
-esnipes = {}  # channel_id: list of edits
+snipes = {}      # channel_id: (author, content, time)
+esnipes = {}     # channel_id: list of edits
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user}")
+    print(f"[INFO] Logged in as {bot.user} (ID: {bot.user.id})")
     if not daily_cat_task.is_running():
         daily_cat_task.start()
 
@@ -97,7 +101,7 @@ async def on_message_edit(before, after):
         esnipes[after.channel.id].append((before.author, before.content, after.content, datetime.datetime.utcnow()))
         if len(esnipes[after.channel.id]) > 20:
             esnipes[after.channel.id].pop(0)
-        log_command(after.author, f"Edited message from '{before.content}' to '{after.content}'", after.channel)
+        log_command(after.author, f"Edited message: {before.content} -> {after.content}", after.channel)
     await bot.process_commands(after)
 
 @bot.event
@@ -236,7 +240,7 @@ async def e_snipe(ctx):
         await ctx.send("No edited messages found.")
 
 # -------------------------------
-# ADMIN / POOKIE COMMANDS
+# ADMIN / POOKIE
 # -------------------------------
 @bot.command()
 async def add_admin(ctx, member: discord.Member):
@@ -284,7 +288,7 @@ async def list_pookie(ctx):
     await ctx.send(f"Pookie users: {', '.join([str(u) for u in users if u])}")
 
 # -------------------------------
-# MODERATION COMMANDS
+# MODERATION
 # -------------------------------
 @bot.command()
 async def ban(ctx, member: discord.Member, *, reason=None):
@@ -329,6 +333,7 @@ async def pong(ctx):
     log_command(ctx.author, "pong", ctx.channel)
 
 # -------------------------------
-# START BOT
+# RUN BOT
 # -------------------------------
+print("[INFO] Starting bot...")
 bot.run(TOKEN)
