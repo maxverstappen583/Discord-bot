@@ -1,29 +1,30 @@
-# Use official Python image
+# Base Python image
 FROM python:3.11-slim
 
-# Set work directory
+# Set working directory
 WORKDIR /app
 
-# Copy current directory contents
+# Copy all files
 COPY . /app
 
-# Install system dependencies for building some Python packages
-RUN apt-get update && apt-get install -y \
+# Install system dependencies required for aiohttp/discord.py
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    libssl-dev \
-    libffi-dev \
     python3-dev \
-    wget \
+    libffi-dev \
+    libssl-dev \
+    curl \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Upgrade pip
-RUN pip install --upgrade pip
+RUN python3 -m pip install --upgrade pip
 
 # Install Python dependencies
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Expose Flask port
+# Expose Flask port for keep-alive
 EXPOSE 8080
 
-# Start bot
-CMD ["python", "main.py"]
+# Start the bot
+CMD ["python3", "main.py"]
