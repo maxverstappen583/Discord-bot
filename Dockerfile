@@ -1,25 +1,20 @@
-# Base image: official Python slim
+# Use official Python image
 FROM python:3.11-slim
 
-# Set working directory
+# Set work directory
 WORKDIR /app
 
-# Copy all files
+# Copy current directory contents into the container
 COPY . /app
 
-# Upgrade pip and install dependencies
+# Upgrade pip
 RUN pip install --upgrade pip
+
+# Install dependencies
 RUN pip install -r requirements.txt
 
-# Set environment variables for Render
-ENV PYTHONUNBUFFERED=1
-ENV DISCORD_BOT_TOKEN=your_token_here
-
-# Expose Flask port
+# Expose port 8080 for Flask
 EXPOSE 8080
 
-# Healthcheck (optional for Render)
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD curl -f http://localhost:8080/ || exit 1
-
-# Run the bot
+# Start the bot
 CMD ["python", "main.py"]
