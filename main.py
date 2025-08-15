@@ -1,4 +1,5 @@
 # main.py
+# Final Master Bot - all features (slash + prefix) + Flask uptime
 import os
 import json
 import random
@@ -14,9 +15,9 @@ from discord import app_commands, ui
 from flask import Flask
 
 # ---------------- CONFIG ----------------
-OWNER_ID = 1319292111325106296  # replace if needed
+OWNER_ID = 1319292111325106296  # your owner ID
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-CAT_API_KEY = os.getenv("CAT_API_KEY", "")  # use TheCatAPI key here
+CAT_API_KEY = os.getenv("CAT_API_KEY", "")
 PORT = int(os.getenv("PORT", 8080))
 
 # ---------------- FLASK UPTIME ----------------
@@ -26,20 +27,20 @@ app = Flask("uptime")
 def home():
     return "Bot is running"
 
-def _run_flask():
+def run_flask():
     app.run(host="0.0.0.0", port=PORT)
 
-threading.Thread(target=_run_flask, daemon=True).start()
+threading.Thread(target=run_flask, daemon=True).start()
 
 # ---------------- STORAGE ----------------
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-def _path(name: str) -> str:
+def path_for(name: str) -> str:
     return os.path.join(DATA_DIR, f"{name}.json")
 
 def load_json(name: str, default):
-    p = _path(name)
+    p = path_for(name)
     if not os.path.exists(p):
         with open(p, "w", encoding="utf-8") as f:
             json.dump(default, f, indent=2)
@@ -51,10 +52,11 @@ def load_json(name: str, default):
             return default
 
 def save_json(name: str, data):
-    p = _path(name)
+    p = path_for(name)
     with open(p, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
+# persistent data
 admins: Dict[str, bool] = load_json("admins", {})         # global admin list (string ids)
 pookies: Dict[str, bool] = load_json("pookies", {})       # pookie users (string ids)
 blacklist: Dict[str, bool] = load_json("blacklist", {})   # blacklisted users
@@ -91,6 +93,7 @@ def is_blacklisted_user(user) -> bool:
     return str(uid) in blacklist
 
 def sanitize_remove_pings(text: str) -> str:
+    # remove @everyone/@here and replace user/role mention patterns with [mention]
     t = text.replace("@everyone", "").replace("@here", "")
     t = re.sub(r"<@!?\d+>", "[mention]", t)
     t = re.sub(r"<@&\d+>", "[mention]", t)
@@ -115,8 +118,8 @@ async def send_log_embed(guild: Optional[discord.Guild], title: str, description
         pass
 
 # ---------------- SNIPE / ESNIPE ----------------
-SNIPE_MAX = 15
-snipe_cache: Dict[str, List[dict]] = {}
+SNIPE_MAX = 25
+snipe_cache: Dict[str, List[dict]] = {}   # channel_id -> list
 esnipe_cache: Dict[str, List[dict]] = {}
 
 def push_snipe(channel_id: int, payload: dict):
@@ -135,7 +138,7 @@ def push_esnipe(channel_id: int, payload: dict):
         arr.pop()
     esnipe_cache[key] = arr
 
-# ---------------- TIME helpers ----------------
+# ---------------- TIME HELPERS ----------------
 def now_ist() -> datetime:
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
@@ -221,7 +224,7 @@ async def on_message(message: discord.Message):
             pass
         return
 
-    # blocked-words (mods bypass)
+    # blocked words (mods bypass)
     if not is_admin_user(message.author):
         low = message.content.lower()
         for w in blocked_words:
@@ -416,7 +419,7 @@ async def cmd_setcatchannel(ctx: commands.Context, channel: discord.TextChannel)
         return await ctx.send(msg)
     await ctx.send(msg)
 
-# Purge (prefix) up to 100
+# Purge (prefix)
 @bot.command(name="purge")
 async def cmd_purge(ctx: commands.Context, amount: int):
     if not is_admin_user(ctx.author):
@@ -431,7 +434,8 @@ async def cmd_purge(ctx: commands.Context, amount: int):
     except Exception as e:
         await ctx.send(f"Failed: {e}")
 
-# Fun / utilities (prefix)
+# ---------------- FUN / UTILITIES (prefix) ----------------
+# Cat
 @bot.command(name="cat")
 async def cmd_cat(ctx: commands.Context):
     url = "https://api.thecatapi.com/v1/images/search"
@@ -445,6 +449,7 @@ async def cmd_cat(ctx: commands.Context):
         cat_url = "https://cataas.com/cat"
     await ctx.send(cat_url)
 
+# rps
 @bot.command(name="rps")
 async def cmd_rps(ctx: commands.Context, choice: str):
     opts = ["rock", "paper", "scissors"]
@@ -460,19 +465,36 @@ async def cmd_rps(ctx: commands.Context, choice: str):
         result = "You lose!"
     await ctx.send(f"You: **{c}** | Me: **{bot_choice}** → {result}")
 
-@bot.command(name="eightball")
+# 8ball
+@bot.command(name="8ball")
 async def cmd_8ball(ctx: commands.Context, *, question: str):
-    answers = ["Yes","No","Maybe","Definitely","Ask again later","It is certain","Very doubtful"]
-    await ctx.send(f"🎱 {random.choice(answers)}")
+    answers = [
+        "It is certain.", "It is decidedly so.", "Without a doubt.", "Yes — definitely.",
+        "You may rely on it.", "As I see it, yes.", "Most likely.", "Outlook good.",
+        "Yes.", "Signs point to yes.", "Reply hazy, try again.", "Ask again later.",
+        "Better not tell you now.", "Cannot predict now.", "Concentrate and ask again.",
+        "Don't count on it.", "My reply is no.", "My sources say no.", "Outlook not so good.",
+        "Very doubtful."
+    ]
+    await ctx.send(random.choice(answers))
 
+# joke / dadjoke
 @bot.command(name="joke")
 async def cmd_joke(ctx: commands.Context):
-    jokes = ["Why did the dev go broke? Because they used all their cache.", "I would tell you a UDP joke but you might not get it."]
+    jokes = [
+        "I told my computer I needed a break, and it said 'No problem — I'll go to sleep.'",
+        "Why don't programmers like nature? Too many bugs.",
+        "Why do Java developers wear glasses? Because they don't C#."
+    ]
     await ctx.send(random.choice(jokes))
 
 @bot.command(name="dadjoke")
 async def cmd_dadjoke(ctx: commands.Context):
-    dads = ["I'm reading a book on anti-gravity. It's impossible to put down!","Why don't scientists trust atoms? Because they make up everything."]
+    dads = [
+        "I'm reading a book about anti-gravity. It's impossible to put down!",
+        "I would avoid the sushi if I was you. It’s a little fishy.",
+        "Want to hear a joke about construction? I'm still working on it."
+    ]
     await ctx.send(random.choice(dads))
 
 @bot.command(name="coinflip")
@@ -485,10 +507,15 @@ async def cmd_rolldice(ctx: commands.Context, sides: int = 6):
         return await ctx.send("Choose sides between 2 and 1000.")
     await ctx.send(f"🎲 {random.randint(1, sides)}")
 
-# Say prefix commands
+# short alias roll
+@bot.command(name="roll")
+async def cmd_roll(ctx: commands.Context, sides: int = 6):
+    await cmd_rolldice.callback(ctx, sides)
+
+# say commands (prefix)
 @bot.command(name="say")
 async def cmd_say(ctx: commands.Context, *, text: str):
-    # NEVER allow pings in normal say
+    # NEVER allow pings in normal say (even for admins/pookies)
     safe = sanitize_remove_pings(text)
     for w in blocked_words:
         if w.lower() in safe.lower():
@@ -501,7 +528,7 @@ async def cmd_say_admin(ctx: commands.Context, *, text: str):
         return await ctx.send("No permission.")
     await ctx.send(text)
 
-# Trigger management (prefix): ?trigger add/remove/list
+# Trigger (prefix): ?trigger add/remove/list
 @bot.command(name="trigger")
 async def cmd_trigger(ctx: commands.Context, action: str, word: Optional[str] = None, *, reply: Optional[str] = None):
     act = action.lower()
@@ -534,7 +561,7 @@ async def cmd_trigger(ctx: commands.Context, action: str, word: Optional[str] = 
         return await ctx.send("Not found.")
     return await ctx.send("Unknown action. Use add/remove/list.")
 
-# Snipe / Esnipe prefix
+# snipe / esnipe (prefix)
 @bot.command(name="snipe")
 async def cmd_snipe(ctx: commands.Context):
     items = snipe_cache.get(str(ctx.channel.id), [])
@@ -562,7 +589,7 @@ async def cmd_showcommands(ctx: commands.Context):
     visible = [c for c in all_cmds if (is_admin_user(ctx.author) or c not in admin_only)]
     await ctx.send("Commands: " + ", ".join(visible))
 
-# Logs prefix command: ?logs [amount]
+# logs prefix: ?logs [amount]
 @bot.command(name="logs")
 async def cmd_logs(ctx: commands.Context, amount: int = 10):
     if not is_admin_user(ctx.author):
@@ -600,7 +627,7 @@ def slash_admin_like():
 @tree.command(name="say", description="Make the bot say something (no pings allowed)")
 @slash_not_blacklisted()
 async def sc_say(inter: discord.Interaction, text: str):
-    safe = sanitize_remove_pings(text)  # no pings for anyone
+    safe = sanitize_remove_pings(text)
     for w in blocked_words:
         if w.lower() in safe.lower():
             return await inter.response.send_message("Message contains blocked word.", ephemeral=True)
@@ -660,8 +687,54 @@ async def sc_rps(inter: discord.Interaction, choice: app_commands.Choice[str]):
         res = "You lose!"
     await inter.response.send_message(f"You: **{c}** | Me: **{bot_choice}** → {res}")
 
-# Trigger slash (action:add/remove/list) - admin only
-@tree.command(name="trigger", description="Manage exact-word triggers (admin only). Usage: /trigger action:add/remove/list word: reply:")
+# 8ball (slash)
+@tree.command(name="8ball", description="Ask the magic 8-ball")
+@slash_not_blacklisted()
+async def sc_8ball(inter: discord.Interaction, question: str):
+    answers = [
+        "It is certain.", "It is decidedly so.", "Without a doubt.", "Yes — definitely.",
+        "You may rely on it.", "As I see it, yes.", "Most likely.", "Outlook good.",
+        "Yes.", "Signs point to yes.", "Reply hazy, try again.", "Ask again later.",
+        "Better not tell you now.", "Cannot predict now.", "Concentrate and ask again.",
+        "Don't count on it.", "My reply is no.", "My sources say no.", "Outlook not so good.",
+        "Very doubtful."
+    ]
+    await inter.response.send_message(random.choice(answers))
+
+@tree.command(name="joke", description="Tell a random joke")
+@slash_not_blacklisted()
+async def sc_joke(inter: discord.Interaction):
+    jokes = [
+        "I told my computer I needed a break, and it said 'No problem — I'll go to sleep.'",
+        "Why don't programmers like nature? Too many bugs.",
+        "Why do Java developers wear glasses? Because they don't C#."
+    ]
+    await inter.response.send_message(random.choice(jokes))
+
+@tree.command(name="dadjoke", description="Tell a dad joke")
+@slash_not_blacklisted()
+async def sc_dadjoke(inter: discord.Interaction):
+    dads = [
+        "I'm reading a book about anti-gravity. It's impossible to put down!",
+        "I would avoid the sushi if I was you. It’s a little fishy.",
+        "Want to hear a joke about construction? I'm still working on it."
+    ]
+    await inter.response.send_message(random.choice(dads))
+
+@tree.command(name="coinflip", description="Flip a coin")
+@slash_not_blacklisted()
+async def sc_coinflip(inter: discord.Interaction):
+    await inter.response.send_message(random.choice(["Heads", "Tails"]))
+
+@tree.command(name="roll", description="Roll a dice (sides)")
+@slash_not_blacklisted()
+async def sc_roll(inter: discord.Interaction, sides: int = 6):
+    if sides < 2 or sides > 1000:
+        return await inter.response.send_message("Choose sides between 2 and 1000.", ephemeral=True)
+    await inter.response.send_message(f"🎲 {random.randint(1, sides)}")
+
+# Trigger (slash) admin-only
+@tree.command(name="trigger", description="Manage exact-word triggers (admin only)")
 @slash_admin_like()
 async def sc_trigger(inter: discord.Interaction, action: str, word: Optional[str] = None, reply: Optional[str] = None):
     act = action.lower()
@@ -688,7 +761,26 @@ async def sc_trigger(inter: discord.Interaction, action: str, word: Optional[str
         return await inter.response.send_message("Not found.", ephemeral=True)
     return await inter.response.send_message("Unknown action. Use add/remove/list.", ephemeral=True)
 
-# Logs (slash): view last N
+# snipe / esnipe slash
+@tree.command(name="snipe", description="Show recently deleted messages in this channel")
+@slash_not_blacklisted()
+async def sc_snipe(inter: discord.Interaction):
+    items = snipe_cache.get(str(inter.channel.id), [])
+    if not items:
+        return await inter.response.send_message("Nothing to snipe.", ephemeral=True)
+    view = NavView(items, "Snipe")
+    await inter.response.send_message(embed=view.make_embed(), view=view)
+
+@tree.command(name="esnipe", description="Show recently edited messages in this channel")
+@slash_not_blacklisted()
+async def sc_esnipe(inter: discord.Interaction):
+    items = esnipe_cache.get(str(inter.channel.id), [])
+    if not items:
+        return await inter.response.send_message("Nothing to e-snipe.", ephemeral=True)
+    view = NavView(items, "E-Snipe")
+    await inter.response.send_message(embed=view.make_embed(), view=view)
+
+# logs (slash)
 @tree.command(name="logs", description="Show last N logs (admin only)")
 @slash_admin_like()
 async def sc_logs(inter: discord.Interaction, amount: Optional[int] = 10):
@@ -728,7 +820,7 @@ async def sc_setcat(inter: discord.Interaction, channel: discord.TextChannel):
         return await inter.response.send_message(msg, ephemeral=True)
     await inter.response.send_message(msg, ephemeral=True)
 
-# showcommands (slash) - show only commands user can use
+# showcommands (slash)
 @tree.command(name="showcommands", description="Show commands you can use")
 @slash_not_blacklisted()
 async def sc_showcommands(inter: discord.Interaction):
@@ -748,7 +840,7 @@ async def sc_showcommands(inter: discord.Interaction):
     names = sorted(visible)
     await inter.response.send_message("Available: " + ", ".join(names), ephemeral=True)
 
-# moderation slash commands (blacklist/ban/kick)
+# moderation slash: blacklist/ban/kick
 @tree.command(name="blacklist_user", description="Blacklist a user (admin only)")
 @slash_admin_like()
 async def sc_blacklist(inter: discord.Interaction, user: discord.User):
@@ -790,7 +882,7 @@ async def sc_kick(inter: discord.Interaction, user: discord.User, reason: Option
     except Exception as e:
         await inter.response.send_message(f"Failed: {e}", ephemeral=True)
 
-# admin/pookie management (slash)
+# admin/pookie slash management
 @tree.command(name="add_admin", description="Owner: add admin")
 @slash_admin_like()
 async def sc_add_admin(inter: discord.Interaction, user: discord.User):
@@ -841,6 +933,6 @@ async def sc_list_pookie(inter: discord.Interaction):
 
 # ---------------- RUN ----------------
 if not BOT_TOKEN:
-    print("ERROR: DISCORD_BOT_TOKEN env var not set. Set in Render environment variables.")
+    print("ERROR: DISCORD_BOT_TOKEN env var not set. Set it in Render environment variables.")
 else:
     bot.run(BOT_TOKEN)
