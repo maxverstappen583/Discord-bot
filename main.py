@@ -17,7 +17,7 @@ from flask import Flask
 OWNER_ID = 1319292111325106296
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", None)
 CAT_API_KEY = os.getenv("CAT_API_KEY", "")
-PORT = int(os.getenv("PORT", 8080))  # Render will provide
+PORT = int(os.getenv("PORT", 8080))  # Render provides PORT
 
 # -------------------- FLASK (uptime) --------------------
 app = Flask("uptime")
@@ -106,22 +106,24 @@ async def send_log_embed(guild: Optional[discord.Guild], title: str, description
 
 # -------------------- SNIPE / ESNIPE --------------------
 SNIPE_MAX = 10
-snipe_cache = {}   # channel_id -> list of dicts
-esnipe_cache = {}  # channel_id -> list of dicts
+snipe_cache = {}   # str(channel_id) -> list of dicts
+esnipe_cache = {}  # str(channel_id) -> list of dicts
 
 def push_snipe(channel_id: int, payload: dict):
-    arr = snipe_cache.get(str(channel_id), [])
+    key = str(channel_id)
+    arr = snipe_cache.get(key, [])
     arr.insert(0, payload)
     if len(arr) > SNIPE_MAX:
         arr.pop()
-    snipe_cache[str(channel_id)] = arr
+    snipe_cache[key] = arr
 
 def push_esnipe(channel_id: int, payload: dict):
-    arr = esnipe_cache.get(str(channel_id), [])
+    key = str(channel_id)
+    arr = esnipe_cache.get(key, [])
     arr.insert(0, payload)
     if len(arr) > SNIPE_MAX:
         arr.pop()
-    esnipe_cache[str(channel_id)] = arr
+    esnipe_cache[key] = arr
 
 # -------------------- IST helper --------------------
 def now_ist() -> datetime:
@@ -139,7 +141,6 @@ async def daily_cat_job():
         today = now.strftime("%Y-%m-%d")
         if last_date == today:
             return
-        # fetch cat
         url = "https://api.thecatapi.com/v1/images/search"
         headers = {"x-api-key": CAT_API_KEY} if CAT_API_KEY else {}
         try:
@@ -398,7 +399,7 @@ async def cmd_8ball(ctx: commands.Context, *, question: str):
 
 @bot.command(name="joke")
 async def cmd_joke(ctx: commands.Context):
-    jokes = ["Why did the dev go broke? Because they used up all their cache.", "I would tell you a UDP joke but you might not get it."]
+    jokes = ["Why did the dev go broke? Because they used all their cache.", "I would tell you a UDP joke but you might not get it."]
     await ctx.send(random.choice(jokes))
 
 @bot.command(name="dadjoke")
@@ -516,8 +517,7 @@ async def cmd_esnipe(ctx: commands.Context):
     view = NavView(items, "E-Snipe")
     await ctx.send(embed=view.make_embed(), view=view)
 
-# -------------------- SLASH COMMANDS (discord.py 2.x) --------------------
-# small decorator helpers
+# -------------------- SLASH COMMAND HELPERS --------------------
 def slash_not_blacklisted():
     async def pred(inter: discord.Interaction):
         if is_blacklisted_user(inter.user):
@@ -534,6 +534,7 @@ def slash_admin_like():
         return True
     return app_commands.check(pred)
 
+# -------------------- SLASH COMMANDS --------------------
 @tree.command(name="avatar", description="Get user's avatar")
 @slash_not_blacklisted()
 async def sc_avatar(inter: discord.Interaction, user: Optional[discord.User] = None):
@@ -576,7 +577,7 @@ async def sc_roll(inter: discord.Interaction, sides: int):
         return await inter.response.send_message("Sides must be between 2 and 1000.", ephemeral=True)
     await inter.response.send_message(f"🎲 {random.randint(1, sides)}")
 
-# RPS: define choices properly via app_commands.choices
+# RPS: choices via app_commands.Choice
 @tree.command(name="rps", description="Rock Paper Scissors")
 @slash_not_blacklisted()
 @app_commands.describe(choice="rock / paper / scissors")
@@ -615,13 +616,11 @@ async def sc_dadjoke(inter: discord.Interaction):
     dads = ["I'm reading a book on anti-gravity. It's impossible to put down!","I used to play piano by ear; now I use my hands."]
     await inter.response.send_message(random.choice(dads))
 
-# showcommands slash
-@tree.command(name="showcommands", description="Show commands you can use")
+@tree.command(name="showcommands", description="Show the commands you can use")
 @slash_not_blacklisted()
 async def sc_showcommands(inter: discord.Interaction):
-    # simple static list mirrored to prefix visibility
-    base = ["avatar","userinfo","cat","coinflip","rolldice","rps","eightball","joke","dadjoke","showtrigger","snipe","esnipe"]
-    admin_only = ["addtrigger","removetrigger","setlogchannel","setcatchannel","ban","kick","blacklist","unblacklist","add_admin","remove_admin","add_pookie","remove_pookie","list_pookie","list_admins"]
+    base = ["avatar","userinfo","cat","coinflip","rolldice","rps","eightball","joke","dadjoke","showtrigger","snipe","esnipe","say"]
+    admin_only = ["addtrigger","removetrigger","setlogchannel","setcatchannel","ban","kick","blacklist","unblacklist","add_admin","remove_admin","add_pookie","remove_pookie","list_pookie","list_admins","say_admin"]
     if is_admin_user(inter.user):
         allc = base + admin_only
     else:
@@ -774,6 +773,27 @@ async def sc_setcat(inter: discord.Interaction, channel: discord.TextChannel):
     cfg["cat_channel_id"] = channel.id
     save_json("config", cfg)
     await inter.response.send_message(f"Daily cat channel set to {channel.mention}")
+
+# SAY slash commands
+@tree.command(name="say", description="Make the bot say something (public, no mass pings)")
+@slash_not_blacklisted()
+async def sc_say(inter: discord.Interaction, text: str):
+    # block mass mentions
+    if "@everyone" in text or "@here" in text:
+        text = text.replace("@everyone", "").replace("@here", "")
+    # block blocked words for non-admins
+    if not is_admin_user(inter.user):
+        for w in blocked_words:
+            if w.lower() in text.lower():
+                return await inter.response.send_message("Message contains blocked word.", ephemeral=True)
+    # send publicly
+    await inter.response.send_message(text)
+
+@tree.command(name="say_admin", description="Admin say (allows mentions)")
+@slash_admin_like()
+async def sc_say_admin(inter: discord.Interaction, text: str):
+    # admin-only; allow mentions
+    await inter.response.send_message(text)
 
 # -------------------- RUN --------------------
 if not BOT_TOKEN:
