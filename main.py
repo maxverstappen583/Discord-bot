@@ -2,8 +2,9 @@
 import os
 import json
 import random
-import asyncio
+import re
 import threading
+import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, List
 
@@ -13,70 +14,75 @@ from discord.ext import commands, tasks
 from discord import app_commands, ui
 from flask import Flask
 
-# -------------------- CONFIG --------------------
+# ---------------- CONFIG ----------------
 OWNER_ID = 1319292111325106296
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", None)
-CAT_API_KEY = os.getenv("CAT_API_KEY", "")
-PORT = int(os.getenv("PORT", 8080))  # Render provides PORT
+CAT_API_KEY = os.getenv("CAT_API_KEY", "")  # optional
+PORT = int(os.getenv("PORT", 8080))        # Render provides this
 
-# Default reply message when exact-match reply word is triggered
-DEFAULT_REPLY_MESSAGE = "Hello!"  # change to whatever default reply you want
+# default reply used when a trigger word is matched (each trigger stores its own reply)
+# Note: triggers will store custom replies per word
 
-# -------------------- FLASK (uptime) --------------------
+# ---------------- FLASK (uptime) ----------------
 app = Flask("uptime")
 
 @app.route("/")
 def home():
-    return "OK"
+    return "Bot is running"
 
-def run_flask():
+def _run_flask():
     app.run(host="0.0.0.0", port=PORT)
 
-threading.Thread(target=run_flask, daemon=True).start()
+threading.Thread(target=_run_flask, daemon=True).start()
 
-# -------------------- DATA STORAGE --------------------
+# ---------------- STORAGE ----------------
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-def path_for(name: str) -> str:
+def _path(name: str) -> str:
     return os.path.join(DATA_DIR, f"{name}.json")
 
 def load_json(name: str, default):
-    p = path_for(name)
+    p = _path(name)
     if not os.path.exists(p):
-        with open(p, "w") as f:
-            json.dump(default, f)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(default, f, indent=2)
         return default
-    with open(p, "r") as f:
+    with open(p, "r", encoding="utf-8") as f:
         try:
             return json.load(f)
         except Exception:
             return default
 
 def save_json(name: str, data):
-    p = path_for(name)
-    with open(p, "w") as f:
+    p = _path(name)
+    with open(p, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
-# persistent structures
-admins = load_json("admins", {})            # {"user_id": true}
-pookies = load_json("pookies", {})          # {"user_id": true}
-blacklist = load_json("blacklist", {})      # {"user_id": true}
+# persistent data
+admins = load_json("admins", {})          # {"id": true}
+pookies = load_json("pookies", {})        # {"id": true}
+blacklist = load_json("blacklist", {})    # {"id": true}
 blocked_words = load_json("blocked_words", [])  # ["badword"]
-triggers = load_json("triggers", {})        # {"hello": "hi"}
-logs = load_json("logs", [])                # list of log entries
+triggers = load_json("triggers", {})      # {"max": "Hello Max!"}
+logs = load_json("logs", [])              # list of log entries
 cfg = load_json("config", {"log_channel_id": None, "cat_channel_id": None, "last_cat_date_ist": None})
-reply_words = load_json("reply_words", [])  # ["max","hello"]
 
-# -------------------- BOT SETUP --------------------
-intents = discord.Intents.all()
+# ---------------- BOT SETUP ----------------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.messages = True
+intents.guilds = True
+intents.reactions = True
+
 bot = commands.Bot(command_prefix="?", intents=intents, help_command=None)
 tree = bot.tree
 
-# -------------------- HELPERS --------------------
+# ---------------- HELPERS ----------------
 def is_owner_user(user: discord.abc.User | int) -> bool:
     uid = user.id if hasattr(user, "id") else int(user)
-    return uid == OWNER_ID
+    return int(uid) == int(OWNER_ID)
 
 def is_admin_user(user: discord.abc.User | int) -> bool:
     uid = user.id if hasattr(user, "id") else int(user)
@@ -97,7 +103,7 @@ def log_add(kind: str, detail: dict):
 
 async def send_log_embed(guild: Optional[discord.Guild], title: str, description: str):
     ch_id = cfg.get("log_channel_id")
-    if not guild or not ch_id:
+    if not (guild and ch_id):
         return
     try:
         ch = guild.get_channel(int(ch_id))
@@ -106,12 +112,21 @@ async def send_log_embed(guild: Optional[discord.Guild], title: str, description
         embed = discord.Embed(title=title, description=description, color=discord.Color.blurple(), timestamp=datetime.utcnow())
         await ch.send(embed=embed)
     except Exception:
+        # avoid raising errors on logging
         pass
 
-# -------------------- SNIPE / ESNIPE --------------------
+def sanitize_remove_pings(text: str) -> str:
+    # Remove @everyone and @here
+    t = text.replace("@everyone", "").replace("@here", "")
+    # Replace user mentions <@...> and role mentions <@&...> with [mention]
+    t = re.sub(r"<@!?\d+>", "[mention]", t)
+    t = re.sub(r"<@&\d+>", "[mention]", t)
+    return t
+
+# ---------------- SNIPE / ESNIPE ----------------
 SNIPE_MAX = 10
-snipe_cache = {}   # str(channel_id) -> list of dicts
-esnipe_cache = {}  # str(channel_id) -> list of dicts
+snipe_cache: dict = {}   # channel_id (str) -> list of dicts
+esnipe_cache: dict = {}
 
 def push_snipe(channel_id: int, payload: dict):
     key = str(channel_id)
@@ -129,22 +144,22 @@ def push_esnipe(channel_id: int, payload: dict):
         arr.pop()
     esnipe_cache[key] = arr
 
-# -------------------- IST helper --------------------
+# ---------------- TIMEZONE / DAILY CAT ----------------
 def now_ist() -> datetime:
+    # IST = UTC + 5:30
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
-# -------------------- DAILY CAT TASK --------------------
 @tasks.loop(minutes=1)
 async def daily_cat_job():
-    ch_id = cfg.get("cat_channel_id")
-    if not ch_id:
+    channel_id = cfg.get("cat_channel_id")
+    if not channel_id:
         return
     now = now_ist()
-    # fire at 11:00 IST
+    # run at 11:00 IST
     if now.hour == 11 and now.minute == 0:
-        last_date = cfg.get("last_cat_date_ist")
+        last = cfg.get("last_cat_date_ist")
         today = now.strftime("%Y-%m-%d")
-        if last_date == today:
+        if last == today:
             return
         url = "https://api.thecatapi.com/v1/images/search"
         headers = {"x-api-key": CAT_API_KEY} if CAT_API_KEY else {}
@@ -155,7 +170,7 @@ async def daily_cat_job():
                     cat_url = (data[0]["url"] if data else None) or "https://cataas.com/cat"
         except Exception:
             cat_url = "https://cataas.com/cat"
-        ch = bot.get_channel(int(ch_id))
+        ch = bot.get_channel(int(channel_id))
         if ch:
             try:
                 await ch.send(cat_url)
@@ -164,7 +179,7 @@ async def daily_cat_job():
         cfg["last_cat_date_ist"] = today
         save_json("config", cfg)
 
-# -------------------- NAV VIEW --------------------
+# ---------------- NAV VIEW ----------------
 class NavView(ui.View):
     def __init__(self, items: List[dict], title: str):
         super().__init__(timeout=120)
@@ -179,25 +194,25 @@ class NavView(ui.View):
         else:
             desc = (f"**Author:** {item.get('author')}\n**Before:** {item.get('before')}\n"
                     f"**After:** {item.get('after')}\n**Time:** {item.get('time')}")
-        embed = discord.Embed(title=f"{self.title} ({self.idx+1}/{len(self.items)})", description=desc, color=discord.Color.dark_teal())
-        return embed
+        e = discord.Embed(title=f"{self.title} ({self.idx+1}/{len(self.items)})", description=desc, color=discord.Color.dark_teal())
+        return e
 
     @ui.button(emoji="⬅️", style=discord.ButtonStyle.secondary)
-    async def back(self, interaction: discord.Interaction, button: ui.Button):
+    async def prev(self, interaction: discord.Interaction, button: ui.Button):
         if self.idx > 0:
             self.idx -= 1
         await interaction.response.edit_message(embed=self.make_embed(), view=self)
 
     @ui.button(emoji="➡️", style=discord.ButtonStyle.secondary)
-    async def forward(self, interaction: discord.Interaction, button: ui.Button):
-        if self.idx < len(self.items)-1:
+    async def next(self, interaction: discord.Interaction, button: ui.Button):
+        if self.idx < len(self.items) - 1:
             self.idx += 1
         await interaction.response.edit_message(embed=self.make_embed(), view=self)
 
-# -------------------- EVENTS --------------------
+# ---------------- EVENTS ----------------
 @bot.event
 async def on_ready():
-    print(f"{bot.user} is online")
+    print(f"{bot.user} online")
     try:
         await tree.sync()
         print("Slash commands synced")
@@ -211,7 +226,15 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Blocked words (mods bypass)
+    # blacklist
+    if is_blacklisted_user(message.author):
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return
+
+    # blocked words (mods bypass)
     if not is_admin_user(message.author):
         low = message.content.lower()
         for w in blocked_words:
@@ -220,31 +243,32 @@ async def on_message(message: discord.Message):
                     await message.delete()
                 except Exception:
                     pass
-                await message.channel.send("That word is not allowed here.", delete_after=5)
+                try:
+                    await message.channel.send("That word is not allowed here.", delete_after=5)
+                except Exception:
+                    pass
                 log_add("blocked_word", {"user": message.author.id, "word": w, "channel": message.channel.id})
                 await send_log_embed(message.guild, "Blocked word", f"{message.author.mention} used blocked word `{w}` in {message.channel.mention}")
                 return
 
-    # Exact-word reply system (case-insensitive exact match)
-    content_stripped = message.content.strip()
-    if content_stripped and any(content_stripped.lower() == rw.lower() for rw in reply_words):
-        # Only respond if exact match (case-insensitive)
-        try:
-            await message.channel.send(DEFAULT_REPLY_MESSAGE)
-            log_add("reply_word_trigger", {"user": message.author.id, "word": content_stripped, "channel": message.channel.id})
-        except Exception:
-            pass
+    # exact-word triggers (case-insensitive exact match)
+    content = message.content.strip()
+    if content:
+        for trigger_word, reply_text in triggers.items():
+            if content.lower() == trigger_word.lower():
+                # reply with stored reply_text but strip pings (no pings allowed in trigger replies)
+                safe = sanitize_remove_pings(reply_text)
+                try:
+                    await message.channel.send(safe)
+                except Exception:
+                    pass
+                log_add("trigger_fired", {"user": message.author.id, "trigger": trigger_word, "channel": message.channel.id})
+                await send_log_embed(message.guild, "Trigger fired", f"{message.author.mention} triggered `{trigger_word}` in {message.channel.mention}")
+                return
 
-    # Auto-responder triggers (contains)
-    low = message.content.lower()
-    for trig, resp in triggers.items():
-        if trig.lower() in low:
-            try:
-                await message.channel.send(resp)
-            except Exception:
-                pass
-            break
-
+    # auto triggers (contains) — optional leftover system: if triggers are used only for exact matches, skip this
+    # (we keep that other triggers mapping for backward compatibility; currently we already used triggers for exact matches)
+    # process commands afterward
     await bot.process_commands(message)
 
 @bot.event
@@ -271,72 +295,72 @@ async def on_member_remove(member: discord.Member):
     log_add("leave", {"user": member.id, "guild": member.guild.id})
     await send_log_embed(member.guild, "Member left", f"{member} left.")
 
-# -------------------- CORE ACTIONS (used by both prefix & slash) --------------------
-async def core_set_log_channel(invoker: discord.abc.User, channel: discord.TextChannel):
+# ---------------- CORE ACTIONS ----------------
+async def set_log_channel(invoker: discord.abc.User, channel: discord.TextChannel):
     if not is_admin_user(invoker):
         return False, "No permission."
     cfg["log_channel_id"] = channel.id
     save_json("config", cfg)
     return True, f"Log channel set to {channel.mention}"
 
-async def core_set_cat_channel(invoker: discord.abc.User, channel: discord.TextChannel):
+async def set_cat_channel(invoker: discord.abc.User, channel: discord.TextChannel):
     if not is_admin_user(invoker):
         return False, "No permission."
     cfg["cat_channel_id"] = channel.id
     save_json("config", cfg)
     return True, f"Daily cat channel set to {channel.mention}"
 
-# -------------------- PREFIX COMMANDS --------------------
-# Admin / Pookie management
-@bot.command(name="add_admin")
-async def cmd_add_admin(ctx: commands.Context, user: discord.User):
+# ---------------- PREFIX COMMANDS ----------------
+# ADMIN / POOKIE MANAGEMENT
+@bot.command(aliases=["addadmin"])
+async def add_admin(ctx: commands.Context, user: discord.User):
     if not is_owner_user(ctx.author):
-        return await ctx.send("Only owner.")
+        return await ctx.send("Only owner can add admins.")
     admins[str(user.id)] = True
     save_json("admins", admins)
     log_add("add_admin", {"by": ctx.author.id, "target": user.id})
     await ctx.send(f"{user.mention} added as admin.")
 
-@bot.command(name="remove_admin")
-async def cmd_remove_admin(ctx: commands.Context, user: discord.User):
+@bot.command(aliases=["removeadmin"])
+async def remove_admin(ctx: commands.Context, user: discord.User):
     if not is_owner_user(ctx.author):
-        return await ctx.send("Only owner.")
+        return await ctx.send("Only owner can remove admins.")
     admins.pop(str(user.id), None)
     save_json("admins", admins)
     log_add("remove_admin", {"by": ctx.author.id, "target": user.id})
     await ctx.send(f"{user.mention} removed from admins.")
 
-@bot.command(name="list_admins")
-async def cmd_list_admins(ctx: commands.Context):
+@bot.command()
+async def list_admins(ctx: commands.Context):
     mentions = [f"<@{uid}>" for uid in admins.keys()]
     await ctx.send("Admins: " + (", ".join(mentions) if mentions else "None"))
 
-@bot.command(name="add_pookie")
-async def cmd_add_pookie(ctx: commands.Context, user: discord.User):
+@bot.command()
+async def add_pookie(ctx: commands.Context, user: discord.User):
     if not is_owner_user(ctx.author):
-        return await ctx.send("Only owner.")
+        return await ctx.send("Only owner can add pookie.")
     pookies[str(user.id)] = True
     save_json("pookies", pookies)
     log_add("add_pookie", {"by": ctx.author.id, "target": user.id})
     await ctx.send(f"{user.mention} added as pookie.")
 
-@bot.command(name="remove_pookie")
-async def cmd_remove_pookie(ctx: commands.Context, user: discord.User):
+@bot.command()
+async def remove_pookie(ctx: commands.Context, user: discord.User):
     if not is_owner_user(ctx.author):
-        return await ctx.send("Only owner.")
+        return await ctx.send("Only owner can remove pookie.")
     pookies.pop(str(user.id), None)
     save_json("pookies", pookies)
     log_add("remove_pookie", {"by": ctx.author.id, "target": user.id})
     await ctx.send(f"{user.mention} removed from pookies.")
 
-@bot.command(name="list_pookie")
-async def cmd_list_pookie(ctx: commands.Context):
+@bot.command()
+async def list_pookie(ctx: commands.Context):
     mentions = [f"<@{uid}>" for uid in pookies.keys()]
     await ctx.send("Pookies: " + (", ".join(mentions) if mentions else "None"))
 
-# Moderation
-@bot.command(name="ban")
-async def cmd_ban(ctx: commands.Context, user: discord.User, *, reason: str = "No reason"):
+# MODERATION
+@bot.command()
+async def ban(ctx: commands.Context, user: discord.User, *, reason: str = "No reason"):
     if not is_admin_user(ctx.author):
         return await ctx.send("No permission.")
     try:
@@ -347,8 +371,8 @@ async def cmd_ban(ctx: commands.Context, user: discord.User, *, reason: str = "N
     except Exception as e:
         await ctx.send(f"Failed: {e}")
 
-@bot.command(name="kick")
-async def cmd_kick(ctx: commands.Context, user: discord.User, *, reason: str = "No reason"):
+@bot.command()
+async def kick(ctx: commands.Context, user: discord.User, *, reason: str = "No reason"):
     if not is_admin_user(ctx.author):
         return await ctx.send("No permission.")
     member = ctx.guild.get_member(user.id)
@@ -362,8 +386,8 @@ async def cmd_kick(ctx: commands.Context, user: discord.User, *, reason: str = "
     except Exception as e:
         await ctx.send(f"Failed: {e}")
 
-@bot.command(name="blacklist")
-async def cmd_blacklist(ctx: commands.Context, user: discord.User):
+@bot.command()
+async def blacklist_user(ctx: commands.Context, user: discord.User):
     if not is_admin_user(ctx.author):
         return await ctx.send("No permission.")
     blacklist[str(user.id)] = True
@@ -371,8 +395,8 @@ async def cmd_blacklist(ctx: commands.Context, user: discord.User):
     await ctx.send(f"{user.mention} blacklisted.")
     log_add("blacklist", {"by": ctx.author.id, "target": user.id})
 
-@bot.command(name="unblacklist")
-async def cmd_unblacklist(ctx: commands.Context, user: discord.User):
+@bot.command()
+async def unblacklist_user(ctx: commands.Context, user: discord.User):
     if not is_admin_user(ctx.author):
         return await ctx.send("No permission.")
     blacklist.pop(str(user.id), None)
@@ -381,23 +405,23 @@ async def cmd_unblacklist(ctx: commands.Context, user: discord.User):
     log_add("unblacklist", {"by": ctx.author.id, "target": user.id})
 
 # Set channels
-@bot.command(name="setlogchannel")
-async def cmd_setlogchannel(ctx: commands.Context, channel: discord.TextChannel):
-    ok, msg = await core_set_log_channel(ctx.author, channel)
+@bot.command()
+async def setlogchannel(ctx: commands.Context, channel: discord.TextChannel):
+    ok, msg = await set_log_channel(ctx.author, channel)
     if not ok:
         return await ctx.send(msg)
     await ctx.send(msg)
 
-@bot.command(name="setcatchannel")
-async def cmd_setcatchannel(ctx: commands.Context, channel: discord.TextChannel):
-    ok, msg = await core_set_cat_channel(ctx.author, channel)
+@bot.command()
+async def setcatchannel(ctx: commands.Context, channel: discord.TextChannel):
+    ok, msg = await set_cat_channel(ctx.author, channel)
     if not ok:
         return await ctx.send(msg)
     await ctx.send(msg)
 
-# Purge (prefix) - up to 100 messages
-@bot.command(name="purge")
-async def cmd_purge(ctx: commands.Context, amount: int):
+# PURGE prefix (max 100)
+@bot.command()
+async def purge(ctx: commands.Context, amount: int):
     if not is_admin_user(ctx.author):
         return await ctx.send("No permission.")
     if amount < 1 or amount > 100:
@@ -410,9 +434,9 @@ async def cmd_purge(ctx: commands.Context, amount: int):
     except Exception as e:
         await ctx.send(f"Failed: {e}")
 
-# Fun / utilities
-@bot.command(name="cat")
-async def cmd_cat(ctx: commands.Context):
+# FUN / UTILITIES (prefix)
+@bot.command()
+async def cat(ctx: commands.Context):
     url = "https://api.thecatapi.com/v1/images/search"
     headers = {"x-api-key": CAT_API_KEY} if CAT_API_KEY else {}
     try:
@@ -424,148 +448,147 @@ async def cmd_cat(ctx: commands.Context):
         cat_url = "https://cataas.com/cat"
     await ctx.send(cat_url)
 
-@bot.command(name="rps")
-async def cmd_rps(ctx: commands.Context, choice: str):
-    options = ["rock","paper","scissors"]
+@bot.command()
+async def rps(ctx: commands.Context, choice: str):
+    opts = ["rock","paper","scissors"]
     c = choice.lower()
-    if c not in options:
-        return await ctx.send("Choose rock, paper or scissors.")
-    bot_c = random.choice(options)
-    if c == bot_c:
+    if c not in opts:
+        return await ctx.send("Choose rock, paper, or scissors.")
+    bot_choice = random.choice(opts)
+    if c == bot_choice:
         res = "Tie!"
-    elif (c=="rock" and bot_c=="scissors") or (c=="paper" and bot_c=="rock") or (c=="scissors" and bot_c=="paper"):
+    elif (c=="rock" and bot_choice=="scissors") or (c=="paper" and bot_choice=="rock") or (c=="scissors" and bot_choice=="paper"):
         res = "You win!"
     else:
         res = "You lose!"
-    await ctx.send(f"You: **{c}** | Me: **{bot_c}** → {res}")
+    await ctx.send(f"You: **{c}** | Me: **{bot_choice}** → {res}")
 
-@bot.command(name="coinflip")
-async def cmd_coinflip(ctx: commands.Context):
+@bot.command()
+async def coinflip(ctx: commands.Context):
     await ctx.send(random.choice(["Heads","Tails"]))
 
-@bot.command(name="rolldice")
-async def cmd_rolldice(ctx: commands.Context, sides: int = 6):
+@bot.command()
+async def rolldice(ctx: commands.Context, sides: int = 6):
     if sides < 2 or sides > 1000:
         return await ctx.send("Choose sides between 2 and 1000.")
     await ctx.send(f"🎲 {random.randint(1, sides)}")
 
-# say commands (prefix)
-@bot.command(name="say")
-async def cmd_say(ctx: commands.Context, *, text: str):
-    # if user is not admin/pookie, remove mass mentions and prevent pinging users
+# SAY prefix commands
+@bot.command()
+async def say(ctx: commands.Context, *, text: str):
     if not is_admin_user(ctx.author):
-        # remove @everyone / @here
-        text = text.replace("@everyone","").replace("@here","")
-        # remove user/role mentions by stripping <@...> and <@&...>
-        import re
-        text = re.sub(r"<@!?\d+>", "[mention]", text)
-        text = re.sub(r"<@&\d+>", "[mention]", text)
-    else:
-        # admin can send pings, but still sanitize mass mentions optionally
-        text = text
-    # blocked words check for non-admins
-    if not is_admin_user(ctx.author):
+        # remove mentions and mass pings
+        safe = sanitize_remove_pings(text)
+        # blocked words check
         for w in blocked_words:
-            if w.lower() in text.lower():
+            if w.lower() in safe.lower():
                 return await ctx.send("Message contains blocked word.")
-    await ctx.send(text)
+        await ctx.send(safe)
+    else:
+        await ctx.send(text)
 
-@bot.command(name="say_admin")
-async def cmd_say_admin(ctx: commands.Context, *, text: str):
+@bot.command()
+async def say_admin(ctx: commands.Context, *, text: str):
     if not is_admin_user(ctx.author):
         return await ctx.send("No permission.")
     await ctx.send(text)
 
-# reply words management (prefix)
-@bot.command(name="add_reply_word")
-async def cmd_add_reply_word(ctx: commands.Context, word: str):
-    if not is_admin_user(ctx.author):
-        return await ctx.send("No permission.")
-    if word.lower() in [w.lower() for w in reply_words]:
-        return await ctx.send("Already present.")
-    reply_words.append(word)
-    save_json("reply_words", reply_words)
-    await ctx.send(f"Added reply word `{word}`")
+# TRIGGER prefix management (admin-only)
+@bot.command()
+async def trigger(ctx: commands.Context, action: str, word: str = None, *, reply: str = None):
+    """
+    prefix usage:
+    ?trigger add <word> <reply>
+    ?trigger remove <word>
+    ?trigger list
+    """
+    action = action.lower()
+    if action == "list":
+        if not is_admin_user(ctx.author) and not is_pookie_user(ctx.author):
+            return await ctx.send("No permission.")
+        if not triggers:
+            return await ctx.send("No triggers set.")
+        lines = [f"`{k}` -> {v}" for k, v in triggers.items()]
+        return await ctx.send("\n".join(lines))
+    if action == "add":
+        if not is_admin_user(ctx.author):
+            return await ctx.send("No permission.")
+        if not word or not reply:
+            return await ctx.send("Usage: ?trigger add <word> <reply>")
+        triggers[word] = reply
+        save_json("triggers", triggers)
+        log_add("trigger_add", {"by": ctx.author.id, "word": word, "reply": reply})
+        return await ctx.send(f"Added trigger `{word}`")
+    if action == "remove":
+        if not is_admin_user(ctx.author):
+            return await ctx.send("No permission.")
+        if not word:
+            return await ctx.send("Usage: ?trigger remove <word>")
+        if word in triggers:
+            triggers.pop(word, None)
+            save_json("triggers", triggers)
+            log_add("trigger_remove", {"by": ctx.author.id, "word": word})
+            return await ctx.send(f"Removed trigger `{word}`")
+        return await ctx.send("Not found.")
+    return await ctx.send("Unknown action. Use add/remove/list.")
 
-@bot.command(name="remove_reply_word")
-async def cmd_remove_reply_word(ctx: commands.Context, word: str):
-    if not is_admin_user(ctx.author):
-        return await ctx.send("No permission.")
-    for existing in reply_words:
-        if existing.lower() == word.lower():
-            reply_words.remove(existing)
-            save_json("reply_words", reply_words)
-            return await ctx.send(f"Removed reply word `{existing}`")
-    await ctx.send("Not found.")
-
-@bot.command(name="list_reply_words")
-async def cmd_list_reply_words(ctx: commands.Context):
-    if not reply_words:
-        return await ctx.send("No reply words set.")
-    await ctx.send("Reply words: " + ", ".join(reply_words))
-
-# snipe / esnipe prefix
-@bot.command(name="snipe")
-async def cmd_snipe(ctx: commands.Context):
+# SNIPES prefix
+@bot.command()
+async def snipe(ctx: commands.Context):
     items = snipe_cache.get(str(ctx.channel.id), [])
     if not items:
         return await ctx.send("Nothing to snipe.")
     view = NavView(items, "Snipe")
     await ctx.send(embed=view.make_embed(), view=view)
 
-@bot.command(name="esnipe")
-async def cmd_esnipe(ctx: commands.Context):
+@bot.command()
+async def esnipe(ctx: commands.Context):
     items = esnipe_cache.get(str(ctx.channel.id), [])
     if not items:
         return await ctx.send("Nothing to e-snipe.")
     view = NavView(items, "E-Snipe")
     await ctx.send(embed=view.make_embed(), view=view)
 
-# utility prefix commands
-@bot.command(name="showcommands")
-async def cmd_showcommands(ctx: commands.Context):
+# SHOW COMMANDS
+@bot.command()
+async def showcommands(ctx: commands.Context):
     all_cmds = [c.name for c in bot.commands if not c.hidden]
     if not is_admin_user(ctx.author):
-        hide = {"ban","kick","blacklist","unblacklist","add_admin","remove_admin","add_pookie","remove_pookie","setlogchannel","setcatchannel","purge"}
+        hide = {"ban","kick","blacklist_user","unblacklist_user","add_admin","remove_admin","add_pookie","remove_pookie","setlogchannel","setcatchannel","purge"}
         visible = [c for c in all_cmds if c not in hide]
     else:
         visible = all_cmds
     await ctx.send("Commands: " + ", ".join(sorted(visible)))
 
-# -------------------- SLASH COMMAND HELPERS --------------------
+# ---------------- SLASH UTIL HELPERS ----------------
 def slash_not_blacklisted():
-    async def pred(inter: discord.Interaction):
+    async def predicate(inter: discord.Interaction):
         if is_blacklisted_user(inter.user):
             await inter.response.send_message("You are blacklisted.", ephemeral=True)
             return False
         return True
-    return app_commands.check(pred)
+    return app_commands.check(predicate)
 
 def slash_admin_like():
-    async def pred(inter: discord.Interaction):
+    async def predicate(inter: discord.Interaction):
         if not is_admin_user(inter.user):
             await inter.response.send_message("No permission.", ephemeral=True)
             return False
         return True
-    return app_commands.check(pred)
+    return app_commands.check(predicate)
 
-# -------------------- SLASH COMMANDS --------------------
-@tree.command(name="say", description="Make the bot say something (public, non-admin pings removed)")
+# ---------------- SLASH COMMANDS ----------------
+@tree.command(name="say", description="Make the bot say something (non-admin pings removed)")
 @slash_not_blacklisted()
 async def sc_say(inter: discord.Interaction, text: str):
     if not is_admin_user(inter.user):
-        # sanitize pings for non-admin
-        import re
-        t = text.replace("@everyone","").replace("@here","")
-        t = re.sub(r"<@!?\d+>", "[mention]", t)
-        t = re.sub(r"<@&\d+>", "[mention]", t)
-        text = t
-        # blocked words check
+        safe = sanitize_remove_pings(text)
         for w in blocked_words:
-            if w.lower() in text.lower():
-                await inter.response.send_message("Message contains blocked word.", ephemeral=True)
-                return
-    await inter.response.send_message(text)
+            if w.lower() in safe.lower():
+                return await inter.response.send_message("Message contains blocked word.", ephemeral=True)
+        await inter.response.send_message(safe)
+    else:
+        await inter.response.send_message(text)
 
 @tree.command(name="say_admin", description="Admin say (allows mentions)")
 @slash_admin_like()
@@ -579,43 +602,49 @@ async def sc_purge(inter: discord.Interaction, amount: int):
         return await inter.response.send_message("Amount must be between 1 and 100.", ephemeral=True)
     if not inter.channel:
         return await inter.response.send_message("This command must be used in a channel.", ephemeral=True)
-    # fetch messages and bulk delete
     try:
-        deleted = await inter.channel.purge(limit=amount+1)  # include command message if present
+        deleted = await inter.channel.purge(limit=amount+1)
         await inter.response.send_message(f"Deleted {len(deleted)-1} messages.", ephemeral=True)
         log_add("purge", {"by": inter.user.id, "channel": inter.channel.id, "amount": amount})
         await send_log_embed(inter.guild, "Purge", f"{inter.user.mention} deleted {amount} messages in {inter.channel.mention}")
     except Exception as e:
         await inter.response.send_message(f"Failed: {e}", ephemeral=True)
 
-# reply words slash management
-@tree.command(name="add_reply_word", description="Add a word for exact-match auto-reply (admin/pookie only)")
+# TRIGGER slash group: /trigger add/remove/list
+@tree.command(name="trigger", description="Manage exact-word triggers (admin only)")
 @slash_admin_like()
-async def sc_add_reply_word(inter: discord.Interaction, word: str):
-    if word.lower() in [w.lower() for w in reply_words]:
-        return await inter.response.send_message("Already present.", ephemeral=True)
-    reply_words.append(word)
-    save_json("reply_words", reply_words)
-    await inter.response.send_message(f"Added reply word `{word}`", ephemeral=True)
+async def sc_trigger(inter: discord.Interaction, action: str, word: Optional[str] = None, reply: Optional[str] = None):
+    """
+    Usage:
+    /trigger action:add word:<word> reply:<reply>
+    /trigger action:remove word:<word>
+    /trigger action:list
+    """
+    act = action.lower()
+    if act == "list":
+        if not triggers:
+            return await inter.response.send_message("No triggers set.", ephemeral=True)
+        lines = [f"`{k}` -> {v}" for k, v in triggers.items()]
+        return await inter.response.send_message("\n".join(lines), ephemeral=True)
+    if act == "add":
+        if not word or not reply:
+            return await inter.response.send_message("Usage: /trigger add <word> <reply>", ephemeral=True)
+        triggers[word] = reply
+        save_json("triggers", triggers)
+        log_add("trigger_add", {"by": inter.user.id, "word": word, "reply": reply})
+        return await inter.response.send_message(f"Added trigger `{word}`", ephemeral=True)
+    if act == "remove":
+        if not word:
+            return await inter.response.send_message("Usage: /trigger remove <word>", ephemeral=True)
+        if word in triggers:
+            triggers.pop(word, None)
+            save_json("triggers", triggers)
+            log_add("trigger_remove", {"by": inter.user.id, "word": word})
+            return await inter.response.send_message(f"Removed trigger `{word}`", ephemeral=True)
+        return await inter.response.send_message("Not found.", ephemeral=True)
+    return await inter.response.send_message("Unknown action. Use add/remove/list.", ephemeral=True)
 
-@tree.command(name="remove_reply_word", description="Remove a reply word (admin/pookie only)")
-@slash_admin_like()
-async def sc_remove_reply_word(inter: discord.Interaction, word: str):
-    for existing in reply_words:
-        if existing.lower() == word.lower():
-            reply_words.remove(existing)
-            save_json("reply_words", reply_words)
-            return await inter.response.send_message(f"Removed reply word `{existing}`", ephemeral=True)
-    await inter.response.send_message("Not found.", ephemeral=True)
-
-@tree.command(name="list_reply_words", description="List exact-match reply words")
-@slash_not_blacklisted()
-async def sc_list_reply_words(inter: discord.Interaction):
-    if not reply_words:
-        return await inter.response.send_message("No reply words set.", ephemeral=True)
-    await inter.response.send_message("Reply words: " + ", ".join(reply_words), ephemeral=True)
-
-# snipe / esnipe slash
+# SNIPE / ESNIPE slash
 @tree.command(name="snipe", description="Show recently deleted messages in this channel")
 @slash_not_blacklisted()
 async def sc_snipe(inter: discord.Interaction):
@@ -634,11 +663,11 @@ async def sc_esnipe(inter: discord.Interaction):
     view = NavView(items, "E-Snipe")
     await inter.response.send_message(embed=view.make_embed(), view=view)
 
-# set channels (slash)
+# Set channels (slash)
 @tree.command(name="setlogchannel", description="Set the logs channel (admin/pookie only)")
 @slash_admin_like()
 async def sc_setlog(inter: discord.Interaction, channel: discord.TextChannel):
-    ok, msg = await core_set_log_channel(inter.user, channel)
+    ok, msg = await set_log_channel(inter.user, channel)
     if not ok:
         return await inter.response.send_message(msg, ephemeral=True)
     await inter.response.send_message(msg, ephemeral=True)
@@ -646,12 +675,12 @@ async def sc_setlog(inter: discord.Interaction, channel: discord.TextChannel):
 @tree.command(name="setcatchannel", description="Set daily cat channel (11:00 IST)")
 @slash_admin_like()
 async def sc_setcat(inter: discord.Interaction, channel: discord.TextChannel):
-    ok, msg = await core_set_cat_channel(inter.user, channel)
+    ok, msg = await set_cat_channel(inter.user, channel)
     if not ok:
         return await inter.response.send_message(msg, ephemeral=True)
     await inter.response.send_message(msg, ephemeral=True)
 
-# moderation slash commands (blacklist/ban/kick)
+# Moderation (slash)
 @tree.command(name="blacklist_user", description="Blacklist a user (admin/pookie only)")
 @slash_admin_like()
 async def sc_blacklist(inter: discord.Interaction, user: discord.User):
@@ -693,7 +722,7 @@ async def sc_kick(inter: discord.Interaction, user: discord.User, reason: Option
     except Exception as e:
         await inter.response.send_message(f"Failed: {e}", ephemeral=True)
 
-# admin/pookie management slash
+# Admin/pookie (slash)
 @tree.command(name="add_admin", description="Owner: add an admin")
 @slash_admin_like()
 async def sc_add_admin(inter: discord.Interaction, user: discord.User):
@@ -742,8 +771,8 @@ async def sc_list_pookie(inter: discord.Interaction):
     mentions = [f"<@{uid}>" for uid in pookies.keys()]
     await inter.response.send_message("Pookies: " + (", ".join(mentions) if mentions else "None"), ephemeral=True)
 
-# -------------------- RUN --------------------
+# ---------------- RUN ----------------
 if not BOT_TOKEN:
-    print("ERROR: DISCORD_BOT_TOKEN env var is not set. Set it in Render.")
+    print("ERROR: DISCORD_BOT_TOKEN is not set. Set it in Render environment variables.")
 else:
     bot.run(BOT_TOKEN)
