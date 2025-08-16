@@ -1,9 +1,20 @@
-FROM python:3.11-slim
+# Use official Python image
+FROM python:3.10-slim
+
+# Set working directory
 WORKDIR /app
-COPY . .
-RUN pip install --upgrade pip
+
+# Copy requirements file first (better caching)
+COPY requirements.txt .
+
+# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+
+# Copy all project files
+COPY . .
+
+# Expose Flask port (for uptime pings)
 EXPOSE 8080
+
+# Start the bot
 CMD ["python", "main.py"]
