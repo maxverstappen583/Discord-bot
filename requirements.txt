@@ -1,6 +1,6 @@
 discord.py==2.3.2
-aiohttp
-requests
-pytz
-psutil
-flask
+aiohttp==3.9.5
+requests==2.31.0
+flask==3.0.3
+psutil==5.9.5
+pytz==2024.1
