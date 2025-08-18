@@ -19,26 +19,29 @@
 # - JSON persistence
 # - Flask keep-alive server (/ and /health)
 
-import os, json, asyncio, re, random, logging, traceback, time, threading, math, platform
+import os, json, asyncio, traceback, aiohttp, re, platform, psutil, time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, List, Tuple
+from zoneinfo import ZoneInfo
 
 import discord
-from discord import app_commands
 from discord.ext import commands, tasks
+from discord import app_commands
 
-import aiohttp
-import psutil
-import pytz
+from flask import Flask
+from threading import Thread
 
-# ---------- ENV ----------
-DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")  # replace on Render
+# ---------------------------
+# ENV
+# ---------------------------
+TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+if not TOKEN:
+    raise RuntimeError("DISCORD_BOT_TOKEN not set")
+
 OWNER_ID = int(os.getenv("OWNER_ID", "1319292111325106296"))
-CAT_API_KEY = os.getenv("CAT_API_KEY", "")
-TZ = os.getenv("TZ", "Asia/Kolkata")
-RENDER_API_KEY = os.getenv("RENDER_API_KEY", "")
-RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "")
-
+RENDER_API_KEY = os.getenv("RENDER_API_KEY", "").strip()
+RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "").strip()
+CAT_API_KEY = os.getenv("CAT_API_KEY", "").strip()
+TZ_NAME = os.getenv("TZ", "Asia/Kolkata")
 IST = pytz.timezone(TZ)
 
 # ---------- STORAGE ----------
