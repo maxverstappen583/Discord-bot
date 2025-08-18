@@ -1,24 +1,21 @@
-# Use official Python runtime as a parent image
+# Dockerfile for Render / generic Docker
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies
+# System deps (ffmpeg optional)
 RUN apt-get update && apt-get install -y \
     build-essential \
-    curl \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy bot files
 COPY . .
 
-# Expose Flask port
-EXPOSE 8080
+ENV TZ="Asia/Kolkata"
 
-# Run bot
+EXPOSE 10000
+
 CMD ["python", "main.py"]
