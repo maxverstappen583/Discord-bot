@@ -1,10 +1,5 @@
-# main.py
-# Full "monster" Discord bot file — hybrid prefix (?) + slash commands,
-# Flask keep-alive, scheduled daily/hourly cat posts, AFK, snipe/esnipe,
-# admin/pookie/owner system, triggers, blocked-words, logs, warns, moderation,
-# role/temp role, mute/unmute, lock/unlock, restart, eval, debug, showcommands, etc.
-#
-# Use environment variables (set in Render or your host). Do not paste tokens here.
+# main.py — Full monster Discord bot with Flask keepalive & JSON persistence
+# Do NOT put tokens directly in this file. Use environment variables.
 
 import os
 import re
@@ -13,8 +8,9 @@ import time
 import asyncio
 import traceback
 import platform
+import random
 import aiohttp
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from threading import Thread
 from typing import Optional, List, Dict, Any
@@ -22,26 +18,22 @@ from typing import Optional, List, Dict, Any
 import discord
 from discord.ext import commands, tasks
 
-# optional
+# Optional imports
 try:
     import psutil
 except Exception:
     psutil = None
 
-# Flask for keep-alive (optional)
 try:
     from flask import Flask
 except Exception:
     Flask = None
 
-# ----------------------------
-# Environment parsing helpers
-# ----------------------------
+# --------------------- ENV helpers ---------------------
 def parse_int_env(v: Optional[str], default: int) -> int:
     if not v:
         return default
     s = str(v).strip()
-    # allow 'KEY = 123' by extracting digits
     m = re.search(r"(\d{5,20})", s)
     if m:
         try:
@@ -68,9 +60,7 @@ def parse_list_env(v: Optional[str]) -> List[int]:
                 pass
     return out
 
-# ----------------------------
-# Read environment variables
-# ----------------------------
+# --------------------- ENV VARS ---------------------
 DISCORD_BOT_TOKEN = (os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN") or "").strip()
 if not DISCORD_BOT_TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN environment variable not set")
@@ -78,41 +68,36 @@ if not DISCORD_BOT_TOKEN:
 OWNER_ID = parse_int_env(os.getenv("OWNER_ID"), 1319292111325106296)
 DEFAULT_ADMINS_ENV = os.getenv("DEFAULT_ADMINS", f"{OWNER_ID},1380315427992768633,909468887098216499")
 DEFAULT_ADMINS = set(parse_list_env(DEFAULT_ADMINS_ENV)) or {OWNER_ID}
-
 CAT_API_KEY = os.getenv("CAT_API_KEY", "").strip()
 RENDER_API_KEY = os.getenv("RENDER_API_KEY", "").strip()
-RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "") or os.getenv("SERVICE_ID", "") or os.getenv("SERVICE")
+RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "") or os.getenv("SERVICE_ID", "")
 TZ_NAME = os.getenv("TZ", "Asia/Kolkata").strip() or "Asia/Kolkata"
 PORT = int(os.getenv("PORT", os.getenv("RENDER_PORT", "10000") or "10000"))
 
-# timezone safe
 try:
     LOCAL_TZ = ZoneInfo(TZ_NAME)
 except Exception:
     LOCAL_TZ = timezone.utc
 
-# ----------------------------
-# Persistence
-# ----------------------------
+# --------------------- Persistence ---------------------
 DATA_FILE = "data.json"
-
 DEFAULT_DATA: Dict[str, Any] = {
-    "admins": [],               # persisted admins (DEFAULT_ADMINS are always treated as admins too)
-    "pookies": [],              # persisted pookie users
-    "blacklist": [],            # blocked user ids
-    "blocked_words": [],        # list of exact words to block (and obfuscation detection)
-    "warns": {},                # user_id -> list of warn dicts
-    "logs": [],                 # list of logs
-    "log_channel": None,        # id
-    "triggers": {},             # word -> response
+    "admins": [],          # persisted admins (DEFAULT_ADMINS are implicitly admins)
+    "pookies": [],
+    "blacklist": [],
+    "blocked_words": [],
+    "warns": {},
+    "logs": [],
+    "log_channel": None,
+    "triggers": {},
     "daily_cat_channel": None,
     "hourly_cat": {"enabled": False, "channel": None, "interval_hours": 1, "last_sent": 0},
-    "snipes": {},               # channel_id -> list
-    "esnipes": {},              # channel_id -> list
-    "afk": {}                   # user_id -> {"reason": str, "since": timestamp}
+    "snipes": {},
+    "esnipes": {},
+    "afk": {}
 }
 
-def ensure_data():
+def ensure_data() -> Dict[str, Any]:
     if not os.path.exists(DATA_FILE):
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_DATA, f, indent=2)
@@ -133,14 +118,11 @@ def ensure_data():
 
 DATA: Dict[str, Any] = ensure_data()
 
-def save_data():
-    global DATA
+def save_data() -> None:
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(DATA, f, indent=2)
 
-# ----------------------------
-# Bot setup
-# ----------------------------
+# --------------------- Bot setup ---------------------
 intents = discord.Intents.all()
 intents.message_content = True
 bot = commands.Bot(command_prefix="?", intents=intents, help_command=None)
@@ -152,23 +134,17 @@ def now_local() -> datetime:
 def now_local_str() -> str:
     return now_local().strftime("%Y-%m-%d %H:%M:%S %Z")
 
-# ----------------------------
-# Flask keep-alive
-# ----------------------------
+# --------------------- Flask keep-alive ---------------------
 if Flask is not None:
-    flask_app = Flask("bot_keepalive")
-    @flask_app.route("/")
-    def _index():
-        return "Bot is running", 200
+    app = Flask("keepalive")
+    @app.route("/")
+    def index():
+        return "Bot is alive", 200
+    def run_flask():
+        app.run(host="0.0.0.0", port=PORT)
+    Thread(target=run_flask, daemon=True).start()
 
-    def _run_flask():
-        flask_app.run(host="0.0.0.0", port=PORT)
-
-    Thread(target=_run_flask, daemon=True).start()
-
-# ----------------------------
-# Utility functions
-# ----------------------------
+# --------------------- Utilities ---------------------
 def is_owner(user: discord.abc.User) -> bool:
     return getattr(user, "id", None) == OWNER_ID
 
@@ -186,7 +162,6 @@ def user_blacklisted(user: discord.abc.User) -> bool:
     return getattr(user, "id", None) in DATA.get("blacklist", [])
 
 def sanitize_no_pings(text: str) -> str:
-    # disable @everyone/here and convert raw mention tags to neutral text
     text = text.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
     text = re.sub(r"<@!?\d+>", "@mention", text)
     return text
@@ -197,11 +172,9 @@ def normalize_for_detect(s: str) -> str:
 def contains_blocked_word(message: str) -> Optional[str]:
     if not message:
         return None
-    # exact-word detection
     for w in DATA.get("blocked_words", []):
         if re.search(rf"\b{re.escape(w)}\b", message, flags=re.IGNORECASE):
             return w
-    # normalized detection
     norm = normalize_for_detect(message)
     for w in DATA.get("blocked_words", []):
         if normalize_for_detect(w) and normalize_for_detect(w) in norm:
@@ -214,8 +187,8 @@ def parse_duration(text: str) -> Optional[int]:
     m = re.fullmatch(r"\s*(\d+)\s*([smhd])\s*$", text.strip(), re.IGNORECASE)
     if not m:
         return None
-    n = int(m.group(1)); unit = m.group(2).lower()
-    mult = {"s":1,"m":60,"h":3600,"d":86400}[unit]
+    n = int(m.group(1)); su = m.group(2).lower()
+    mult = {"s":1,"m":60,"h":3600,"d":86400}[su]
     return n * mult
 
 async def fetch_cat_url() -> Optional[str]:
@@ -232,7 +205,7 @@ async def fetch_cat_url() -> Optional[str]:
         pass
     return None
 
-def log_command(user: discord.abc.User, command_name: str, channel: Optional[discord.abc.Messageable]):
+def log_command(user: discord.abc.User, command_name: str, channel: Optional[discord.abc.Messageable]) -> None:
     entry = {
         "time": now_local_str(),
         "user": f"{getattr(user,'name',str(user))} ({getattr(user,'id','')})",
@@ -242,13 +215,12 @@ def log_command(user: discord.abc.User, command_name: str, channel: Optional[dis
     DATA.setdefault("logs", []).append(entry)
     DATA["logs"] = DATA["logs"][-1000:]
     save_data()
-    # post to log channel if set
     ch_id = DATA.get("log_channel")
     if ch_id:
         try:
             ch = bot.get_channel(int(ch_id))
             if ch and isinstance(ch, discord.TextChannel):
-                embed = discord.Embed(title="Command Log", color=discord.Color.blurple(), timestamp=datetime.utcnow())
+                embed = discord.Embed(title="Command Log", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
                 embed.add_field(name="User", value=entry["user"], inline=False)
                 embed.add_field(name="Command", value=entry["command"], inline=False)
                 embed.add_field(name="Channel", value=entry["channel"], inline=False)
@@ -256,12 +228,9 @@ def log_command(user: discord.abc.User, command_name: str, channel: Optional[dis
         except Exception:
             pass
 
-# ----------------------------
-# Events
-# ----------------------------
+# --------------------- Events: ready, message, snipes, edits ---------------------
 @bot.event
 async def on_ready():
-    # sync commands (best-effort)
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} application commands")
@@ -320,7 +289,7 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Remove AFK if the author speaks again
+    # remove AFK when user speaks
     uid = str(message.author.id)
     if uid in DATA.get("afk", {}):
         DATA["afk"].pop(uid, None)
@@ -342,7 +311,7 @@ async def on_message(message: discord.Message):
                 pass
             return
 
-    # AFK mention handling
+    # AFK mention handling and reply-to detection
     if message.mentions:
         for m in message.mentions:
             info = DATA.get("afk", {}).get(str(m.id))
@@ -357,7 +326,6 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
 
-    # reply-to AFK detection
     if message.reference and getattr(message.reference, "resolved", None):
         ref = message.reference.resolved
         if ref and getattr(ref, "author", None):
@@ -385,9 +353,7 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# ----------------------------
-# NavView for snipe navigation
-# ----------------------------
+# --------------------- NavView for snipe ---------------------
 class NavView(discord.ui.View):
     def __init__(self, items: List[Dict[str, Any]]):
         super().__init__(timeout=120)
@@ -422,11 +388,43 @@ class NavView(discord.ui.View):
         self.idx = (self.idx + 1) % len(self.items)
         await inter.response.edit_message(embed=self.embed_for(), view=self)
 
-# ----------------------------
-# Commands (hybrid)
-# ----------------------------
+# --------------------- Trigger Add Modal & View ---------------------
+class TriggerAddModal(discord.ui.Modal, title="Add Trigger"):
+    word = discord.ui.TextInput(label="Trigger word (exact)", placeholder="hello", max_length=100)
+    reply = discord.ui.TextInput(label="Reply (use {user} to mention)", style=discord.TextStyle.long, placeholder="Hi {user}!", max_length=2000)
 
-# ---------------- AFK ----------------
+    def __init__(self, invoker_id: int):
+        super().__init__()
+        self.invoker_id = invoker_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin_or_pookie(interaction.user) and not is_owner(interaction.user):
+            await interaction.response.send_message("❌ No permission to add triggers.", ephemeral=True)
+            return
+        word = self.word.value.strip().lower()
+        reply = self.reply.value.strip()
+        if not word or not reply:
+            await interaction.response.send_message("Invalid input.", ephemeral=True)
+            return
+        DATA.setdefault("triggers", {})[word] = reply
+        save_data()
+        await interaction.response.send_message(f"✅ Trigger `{word}` added.", ephemeral=True)
+
+class TriggerView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="Add trigger", style=discord.ButtonStyle.primary)
+    async def add_trigger(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_admin_or_pookie(interaction := inter.user) and not is_owner(interaction):
+            await inter.response.send_message("❌ No permission.", ephemeral=True)
+            return
+        modal = TriggerAddModal(invoker_id=inter.user.id)
+        await inter.response.send_modal(modal)
+
+# --------------------- Commands (hybrid) ---------------------
+
+# -- AFK --
 @bot.hybrid_command(name="afk", description="Set your AFK with optional reason")
 async def cmd_afk(ctx: commands.Context, *, reason: str = "AFK"):
     uid = str(ctx.author.id)
@@ -457,7 +455,7 @@ async def cmd_remove_afk(ctx: commands.Context):
     else:
         await ctx.reply("You are not AFK.")
 
-# ---------------- Avatar ----------------
+# -- Avatar & Userinfo --
 @bot.hybrid_command(name="avatar", description="Show a user's avatar")
 async def cmd_avatar(ctx: commands.Context, user: Optional[discord.User] = None):
     user = user or ctx.author
@@ -465,7 +463,21 @@ async def cmd_avatar(ctx: commands.Context, user: Optional[discord.User] = None)
     embed.set_image(url=user.display_avatar.url)
     await ctx.reply(embed=embed)
 
-# ---------------- Say (no pings) ----------------
+@bot.hybrid_command(name="userinfo", description="Show info about a user")
+async def cmd_userinfo(ctx: commands.Context, member: Optional[discord.Member] = None):
+    member = member or ctx.author
+    embed = discord.Embed(title=f"User Info - {member}", color=discord.Color.blue())
+    embed.set_thumbnail(url=member.display_avatar.url if member.display_avatar else discord.Embed.Empty)
+    embed.add_field(name="Username", value=member.name, inline=True)
+    embed.add_field(name="Discriminator", value=f"#{member.discriminator}", inline=True)
+    embed.add_field(name="ID", value=str(member.id), inline=True)
+    embed.add_field(name="Created At", value=member.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"), inline=False)
+    embed.add_field(name="Joined At", value=member.joined_at.strftime("%Y-%m-%d %H:%M:%S UTC") if member.joined_at else "N/A", inline=False)
+    embed.add_field(name="Top Role", value=member.top_role.mention if member.top_role else "N/A", inline=True)
+    embed.add_field(name="Bot?", value="Yes 🤖" if member.bot else "No", inline=True)
+    await ctx.reply(embed=embed)
+
+# -- Say / Say_admin --
 @bot.hybrid_command(name="say", description="Repeat text (pings blocked)")
 async def cmd_say(ctx: commands.Context, *, message: str):
     if user_blacklisted(ctx.author):
@@ -476,15 +488,14 @@ async def cmd_say(ctx: commands.Context, *, message: str):
     log_command(ctx.author, "say", ctx.channel)
     await ctx.reply(out)
 
-# ---------------- Say admin ----------------
-@bot.hybrid_command(name="say_admin", description="Admin/Pookie: repeat text (pings allowed)")
+@bot.hybrid_command(name="say_admin", description="Admin/pookie/owner only: repeat text (pings allowed)")
 async def cmd_say_admin(ctx: commands.Context, *, message: str):
     if not is_admin_or_pookie(ctx.author) and not is_owner(ctx.author):
         return await ctx.reply("❌ No permission.")
     log_command(ctx.author, "say_admin", ctx.channel)
     await ctx.reply(message)
 
-# ---------------- Sync / Refresh ----------------
+# -- Refresh / Sync --
 @bot.hybrid_command(name="refresh", description="Sync slash commands (Admin/Pookie/Owner)")
 async def cmd_refresh(ctx: commands.Context):
     if not is_admin_or_pookie(ctx.author) and not is_owner(ctx.author):
@@ -496,8 +507,8 @@ async def cmd_refresh(ctx: commands.Context):
     except Exception as e:
         await ctx.reply(f"Sync error: {e}")
 
-# ---------------- Restart / Eval / Debug ----------------
-@bot.hybrid_command(name="restart", description="Owner: restart (Render deploy if configured)")
+# -- Restart via Render and fallback exit --
+@bot.hybrid_command(name="restart", description="Owner only: restart (Render deploy if configured)")
 async def cmd_restart(ctx: commands.Context):
     if not is_owner(ctx.author):
         return await ctx.reply("❌ Owner only.")
@@ -509,7 +520,7 @@ async def cmd_restart(ctx: commands.Context):
             try:
                 async with sess.post(url, headers=headers, json={"clearCache": True}, timeout=30) as resp:
                     txt = await resp.text()
-                    await ctx.reply(f"Render response {resp.status}: {txt[:1000]}")
+                    await ctx.reply(f"Render response {resp.status}.")
             except Exception as e:
                 await ctx.reply(f"Render API error: {e}")
     else:
@@ -517,7 +528,8 @@ async def cmd_restart(ctx: commands.Context):
         await asyncio.sleep(1)
         os._exit(1)
 
-@bot.hybrid_command(name="eval", description="Owner: evaluate python (careful!)")
+# -- Eval (owner only) --
+@bot.hybrid_command(name="eval", description="Owner-only: evaluate python (dangerous)")
 async def cmd_eval(ctx: commands.Context, *, code: str):
     if not is_owner(ctx.author):
         return await ctx.reply("❌ Owner only.")
@@ -535,48 +547,69 @@ async def cmd_eval(ctx: commands.Context, *, code: str):
         out = out[:1900] + "…"
     await ctx.reply(f"```py\n{out}\n```")
 
-@bot.hybrid_command(name="debug", description="Show debug info (Admin/Pookie/Owner)")
+# -- Debug --
+@bot.hybrid_command(name="debug", description="Admin/Pookie/Owner: debug info")
 async def cmd_debug(ctx: commands.Context):
     if not is_admin_or_pookie(ctx.author) and not is_owner(ctx.author):
         return await ctx.reply("❌ No permission.")
     uptime_s = int(time.time() - bot.start_time)
-    uptime = str(timedelta(seconds=uptime_s)) if 'timedelta' in globals() else f"{uptime_s}s"
+    uptime = str(timedelta(seconds=uptime_s))
     guild_count = len(bot.guilds)
     member_count = sum((g.member_count for g in bot.guilds), 0)
-    commands_loaded = len((await bot.tree.fetch_commands()) if hasattr(bot.tree, "fetch_commands") else [])
-    mem = psutil.Process(os.getpid()).memory_info().rss / 1024**2 if psutil else None
-    cpu = psutil.cpu_percent(interval=0.1) if psutil else None
+    try:
+        cmd_count = len(await bot.tree.fetch_commands())
+    except Exception:
+        cmd_count = len(bot.commands)
+    mem = None
+    cpu = None
+    if psutil:
+        try:
+            mem = psutil.Process(os.getpid()).memory_info().rss / 1024**2
+            cpu = psutil.cpu_percent(interval=0.1)
+        except Exception:
+            pass
     embed = discord.Embed(title="🛠 Debug Info", color=discord.Color.green())
-    embed.add_field(name="Uptime", value=f"{uptime}", inline=True)
+    embed.add_field(name="Uptime", value=uptime, inline=True)
     embed.add_field(name="Latency", value=f"{round(bot.latency*1000)} ms", inline=True)
     embed.add_field(name="Guilds", value=str(guild_count), inline=True)
     embed.add_field(name="Members", value=str(member_count), inline=True)
-    embed.add_field(name="Commands", value=str(commands_loaded), inline=True)
+    embed.add_field(name="Commands (approx)", value=str(cmd_count), inline=True)
     if mem is not None:
         embed.add_field(name="Memory (MB)", value=f"{mem:.1f}", inline=True)
     if cpu is not None:
-        embed.add_field(name="CPU %", value=f"{cpu}%", inline=True)
+        embed.add_field(name="CPU %", value=f"{cpu}", inline=True)
     embed.add_field(name="Timezone", value=TZ_NAME, inline=True)
     embed.add_field(name="Owner ID", value=str(OWNER_ID), inline=True)
     embed.set_footer(text=f"Python {platform.python_version()} | discord.py {discord.__version__}")
     await ctx.reply(embed=embed, ephemeral=True)
 
-# ---------------- Showcommands (filtered) ----------------
+# -- Showcommands (filtered) --
+COMMAND_CATEGORIES = {
+    "Public": ["say","avatar","userinfo","afk","show_afk","cat","coin","roll","rps","joke","dadjoke","8ball","snipe","esnipe","serverinfo","showcommands","trigger_list"],
+    "Admin": ["say_admin","setlogchannel","disable_log_channel","add_pookie","remove_pookie","listpookie","warn","show_warns","remove_warn","clear_warns","giverole","removerole","temprole","lock","unlock","mute","unmute","setdailycatchannel","sethourlycatchannel","hourlycat_on","hourlycat_off","trigger_add","trigger_remove","trigger_list","refresh","logs","blacklist","unblacklist","add_admin","remove_admin","listadmin"],
+    "Owner": ["restart","eval"]
+}
+
 @bot.hybrid_command(name="showcommands", description="Show commands you can use (filtered)")
 async def cmd_showcommands(ctx: commands.Context):
-    public = ["say", "avatar", "afk", "show_afk", "cat", "snipe", "esnipe", "serverinfo"]
-    admin = ["say_admin","setlogchannel","disable_log_channel","add_pookie","remove_pookie","listpookie","warn","show_warns","remove_warn","clear_warns",
-             "giverole","removerole","temprole","lock","unlock","mute","unmute","setdailycatchannel","sethourlycatchannel","trigger_add","trigger_remove","trigger_list","refresh","logs"]
-    owner = ["add_admin","remove_admin","listadmin","restart","eval"]
-    lines = ["**Public**: " + ", ".join(public)]
-    if is_admin_or_pookie(ctx.author) or is_owner(ctx.author):
-        lines.append("**Admin/Pookie**: " + ", ".join(admin))
-    if is_owner(ctx.author):
-        lines.append("**Owner**: " + ", ".join(owner))
+    lines = []
+    for cat, cmds in COMMAND_CATEGORIES.items():
+        visible = []
+        for name in cmds:
+            # owner-only commands
+            if cat == "Owner" and not is_owner(ctx.author):
+                continue
+            if cat == "Admin" and not (is_admin_or_pookie(ctx.author) or is_owner(ctx.author)):
+                continue
+            visible.append(name)
+        if visible:
+            lines.append(f"**{cat}**: " + ", ".join(visible))
+    if not lines:
+        return await ctx.reply("No commands available to you.", ephemeral=True)
     await ctx.reply("\n".join(lines), ephemeral=True)
 
-# ---------------- Logging channel & view logs ----------------
-@bot.hybrid_command(name="setlogchannel", description="Set log channel (Admin/Pookie)")
+# -- Logging channel & logs --
+@bot.hybrid_command(name="setlogchannel", description="Set channel to receive logs (Admin/Pookie)")
 async def cmd_setlogchannel(ctx: commands.Context, channel: discord.TextChannel):
     if not is_admin_or_pookie(ctx.author) and not is_owner(ctx.author):
         return await ctx.reply("❌ No permission.")
@@ -584,7 +617,7 @@ async def cmd_setlogchannel(ctx: commands.Context, channel: discord.TextChannel)
     save_data()
     await ctx.reply(f"✅ Log channel set to {channel.mention}")
 
-@bot.hybrid_command(name="disable_log_channel", description="Disable log channel")
+@bot.hybrid_command(name="disable_log_channel", description="Disable the log channel")
 async def cmd_disable_log_channel(ctx: commands.Context):
     if not is_admin_or_pookie(ctx.author) and not is_owner(ctx.author):
         return await ctx.reply("❌ No permission.")
@@ -604,7 +637,7 @@ async def cmd_logs(ctx: commands.Context, amount: int = 10):
         msg = msg[-1900:]
     await ctx.reply(f"```\n{msg}\n```", ephemeral=True)
 
-# ---------------- Triggers ----------------
+# -- Triggers (add/remove/list + UI) --
 @bot.hybrid_command(name="trigger_add", description="Add exact-word trigger (Admin/Pookie). Use {user} to mention.")
 async def cmd_trigger_add(ctx: commands.Context, word: str, *, reply: str):
     if not is_admin_or_pookie(ctx.author) and not is_owner(ctx.author):
@@ -613,7 +646,7 @@ async def cmd_trigger_add(ctx: commands.Context, word: str, *, reply: str):
     save_data()
     await ctx.reply(f"✅ Trigger added: `{word}` -> {reply}")
 
-@bot.hybrid_command(name="trigger_remove", description="Remove trigger (Admin/Pookie)")
+@bot.hybrid_command(name="trigger_remove", description="Remove a trigger")
 async def cmd_trigger_remove(ctx: commands.Context, word: str):
     if not is_admin_or_pookie(ctx.author) and not is_owner(ctx.author):
         return await ctx.reply("❌ No permission.")
@@ -628,10 +661,12 @@ async def cmd_trigger_list(ctx: commands.Context):
     if not t:
         return await ctx.reply("No triggers set.", ephemeral=True)
     lines = [f"`{k}` -> {v}" for k,v in t.items()]
-    await ctx.reply("\n".join(lines), ephemeral=True)
+    # If invoked as a slash we can show a button to add
+    view = TriggerView()
+    await ctx.reply("\n".join(lines), view=view, ephemeral=True)
 
-# ---------------- Cat commands and schedulers ----------------
-@bot.hybrid_command(name="cat", description="Random cat picture")
+# -- Cat & scheduling --
+@bot.hybrid_command(name="cat", description="Get a random cat image")
 async def cmd_cat(ctx: commands.Context):
     await ctx.defer()
     url = await fetch_cat_url()
@@ -660,7 +695,7 @@ async def cmd_sethourlycatchannel(ctx: commands.Context, channel: discord.TextCh
     save_data()
     await ctx.reply(f"Hourly cats enabled in {channel.mention} every {h['interval_hours']} hours")
 
-@bot.hybrid_command(name="hourlycat_on", description="Enable hourly cats (Admin/Pookie)")
+@bot.hybrid_command(name="hourlycat_on", description="Enable hourly cats")
 async def cmd_hourlycat_on(ctx: commands.Context):
     if not is_admin_or_pookie(ctx.author) and not is_owner(ctx.author):
         return await ctx.reply("❌ No permission.")
@@ -668,7 +703,7 @@ async def cmd_hourlycat_on(ctx: commands.Context):
     save_data()
     await ctx.reply("Hourly cat posting enabled.")
 
-@bot.hybrid_command(name="hourlycat_off", description="Disable hourly cats (Admin/Pookie)")
+@bot.hybrid_command(name="hourlycat_off", description="Disable hourly cats")
 async def cmd_hourlycat_off(ctx: commands.Context):
     if not is_admin_or_pookie(ctx.author) and not is_owner(ctx.author):
         return await ctx.reply("❌ No permission.")
@@ -724,7 +759,7 @@ async def hourly_cat_loop():
     except Exception:
         pass
 
-# ---------------- Snipe / Esnipe ----------------
+# -- Snipe / Esnipe --
 @bot.hybrid_command(name="snipe", description="Show recently deleted messages in this channel")
 async def cmd_snipe(ctx: commands.Context):
     ch_id = str(ctx.channel.id)
@@ -743,7 +778,7 @@ async def cmd_esnipe(ctx: commands.Context):
     view = NavView(items)
     await ctx.reply(embed=view.embed_for(), view=view, ephemeral=True)
 
-# ---------------- Moderation: kick / ban / purge ----------------
+# -- Moderation: kick / ban / purge --
 @bot.hybrid_command(name="kick", description="Kick a member (Admin/Pookie/Owner)")
 async def cmd_kick(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason"):
     if not is_admin_or_pookie(ctx.author) and not is_owner(ctx.author):
@@ -778,7 +813,7 @@ async def cmd_purge(ctx: commands.Context, amount: int = 10):
     except Exception as e:
         await ctx.reply(f"Error: {e}")
 
-# ---------------- Role management ----------------
+# -- Role management & temp role --
 @bot.hybrid_command(name="giverole", description="Give role to a member (Admin/Pookie)")
 async def cmd_giverole(ctx: commands.Context, member: discord.Member, role: discord.Role):
     if not is_admin_or_pookie(ctx.author):
@@ -807,7 +842,7 @@ async def cmd_temprole(ctx: commands.Context, member: discord.Member, role: disc
         return await ctx.reply("❌ No permission.")
     seconds = parse_duration(duration)
     if not seconds:
-        return await ctx.reply("Invalid duration. Use like `10m`, `12h`, `4d`.")
+        return await ctx.reply("Invalid duration. Use `10m`, `12h`, `4d`.")
     try:
         await member.add_roles(role, reason=f"temp by {ctx.author} for {duration}")
         log_command(ctx.author, f"temprole {role.id} to {member.id} for {duration}", ctx.channel)
@@ -822,7 +857,7 @@ async def cmd_temprole(ctx: commands.Context, member: discord.Member, role: disc
     except Exception as e:
         await ctx.reply(f"Error: {e}")
 
-# ---------------- Mute / Unmute ----------------
+# -- Mute / Unmute helpers & commands --
 async def ensure_muted_role(guild: discord.Guild) -> discord.Role:
     role = discord.utils.get(guild.roles, name="Muted")
     if role:
@@ -874,7 +909,7 @@ async def cmd_unmute(ctx: commands.Context, member: discord.Member):
     except Exception as e:
         await ctx.reply(f"Error: {e}")
 
-# ---------------- Lock / Unlock ----------------
+# -- Lock / Unlock channel --
 @bot.hybrid_command(name="lock", description="Lock a channel for @everyone (Admin/Pookie)")
 async def cmd_lock(ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
     if not is_admin_or_pookie(ctx.author):
@@ -903,7 +938,7 @@ async def cmd_unlock(ctx: commands.Context, channel: Optional[discord.TextChanne
     except Exception as e:
         await ctx.reply(f"Error: {e}")
 
-# ---------------- Warns ----------------
+# -- Warns & Blacklist --
 @bot.hybrid_command(name="warn", description="Warn a user (Admin/Pookie)")
 async def cmd_warn(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason"):
     if not is_admin_or_pookie(ctx.author):
@@ -950,8 +985,7 @@ async def cmd_clear_warns(ctx: commands.Context, member: discord.Member):
     log_command(ctx.author, f"clear_warns {member.id}", ctx.channel)
     await ctx.reply(f"Cleared all warns for {member.mention}")
 
-# ---------------- Blacklist ----------------
-@bot.hybrid_command(name="blacklist", description="Blacklist a user (Admin/Pookie)")
+@bot.hybrid_command(name="blacklist", description="Blacklist a user (Admin/Pookie/Owner)")
 async def cmd_blacklist(ctx: commands.Context, user: discord.User):
     if not is_admin_or_pookie(ctx.author) and not is_owner(ctx.author):
         return await ctx.reply("❌ No permission.")
@@ -961,7 +995,7 @@ async def cmd_blacklist(ctx: commands.Context, user: discord.User):
         save_data()
     await ctx.reply(f"Blacklisted {user.mention}")
 
-@bot.hybrid_command(name="unblacklist", description="Remove from blacklist (Admin/Pookie)")
+@bot.hybrid_command(name="unblacklist", description="Remove user from blacklist (Admin/Pookie/Owner)")
 async def cmd_unblacklist(ctx: commands.Context, user: discord.User):
     if not is_admin_or_pookie(ctx.author) and not is_owner(ctx.author):
         return await ctx.reply("❌ No permission.")
@@ -971,8 +1005,8 @@ async def cmd_unblacklist(ctx: commands.Context, user: discord.User):
         save_data()
     await ctx.reply(f"Removed {user.mention} from blacklist")
 
-# ---------------- Admin & Pookie management ----------------
-@bot.hybrid_command(name="add_admin", description="Owner only: add an admin.")
+# -- Admin & Pookie management --
+@bot.hybrid_command(name="add_admin", description="Owner: add admin")
 async def cmd_add_admin(ctx: commands.Context, user: discord.User):
     if not is_owner(ctx.author):
         return await ctx.reply("❌ Owner only.")
@@ -982,7 +1016,7 @@ async def cmd_add_admin(ctx: commands.Context, user: discord.User):
         save_data()
     await ctx.reply(f"Added admin: {user.mention}")
 
-@bot.hybrid_command(name="remove_admin", description="Owner only: remove an admin.")
+@bot.hybrid_command(name="remove_admin", description="Owner: remove admin")
 async def cmd_remove_admin(ctx: commands.Context, user: discord.User):
     if not is_owner(ctx.author):
         return await ctx.reply("❌ Owner only.")
@@ -997,7 +1031,7 @@ async def cmd_list_admin(ctx: commands.Context):
     admins_list = set(DATA.get("admins", []) or []) | DEFAULT_ADMINS
     await ctx.reply(", ".join(f"<@{a}>" for a in admins_list))
 
-@bot.hybrid_command(name="add_pookie", description="Add a pookie (Admin/Pookie/Owner allowed).")
+@bot.hybrid_command(name="add_pookie", description="Add pookie (Admin/Owner)")
 async def cmd_add_pookie(ctx: commands.Context, user: discord.User):
     if not is_admin_or_pookie(ctx.author) and not is_owner(ctx.author):
         return await ctx.reply("❌ No permission.")
@@ -1007,7 +1041,7 @@ async def cmd_add_pookie(ctx: commands.Context, user: discord.User):
         save_data()
     await ctx.reply(f"Added pookie: {user.mention}")
 
-@bot.hybrid_command(name="remove_pookie", description="Remove a pookie (Admin/Pookie/Owner allowed).")
+@bot.hybrid_command(name="remove_pookie", description="Remove pookie (Admin/Owner)")
 async def cmd_remove_pookie(ctx: commands.Context, user: discord.User):
     if not is_admin_or_pookie(ctx.author) and not is_owner(ctx.author):
         return await ctx.reply("❌ No permission.")
@@ -1024,8 +1058,8 @@ async def cmd_list_pookie(ctx: commands.Context):
         return await ctx.reply("No pookies set.")
     await ctx.reply(", ".join(f"<@{p}>" for p in pks))
 
-# ---------------- Server info & servers ----------------
-@bot.hybrid_command(name="serverinfo", description="Detailed server information.")
+# -- Server info & servers --
+@bot.hybrid_command(name="serverinfo", description="Detailed server info")
 async def cmd_serverinfo(ctx: commands.Context):
     g = ctx.guild
     if not g:
@@ -1042,7 +1076,7 @@ async def cmd_serverinfo(ctx: commands.Context):
     embed.add_field(name="Boosts", value=str(g.premium_subscription_count))
     await ctx.reply(embed=embed)
 
-@bot.hybrid_command(name="servers", description="List servers the bot is in (Admin/Pookie/Owner)")
+@bot.hybrid_command(name="servers", description="List bot servers (Admin/Pookie/Owner)")
 async def cmd_servers(ctx: commands.Context):
     if not is_admin_or_pookie(ctx.author) and not is_owner(ctx.author):
         return await ctx.reply("❌ No permission.")
@@ -1052,14 +1086,99 @@ async def cmd_servers(ctx: commands.Context):
         out = out[:1900] + "…"
     await ctx.reply(out, ephemeral=True)
 
-# ----------------------------
-# Startup: loops and run
-# ----------------------------
+# --------------------- Fun commands (8ball, joke, dadjoke, coin, roll, rps) ---------------------
+EIGHT_BALL = [
+    "It is certain.", "It is decidedly so.", "Without a doubt.", "Yes — definitely.",
+    "You may rely on it.", "As I see it, yes.", "Most likely.", "Outlook good.",
+    "Yes.", "Signs point to yes.", "Reply hazy, try again.", "Ask again later.",
+    "Better not tell you now.", "Cannot predict now.", "Concentrate and ask again.",
+    "Don't count on it.", "My reply is no.", "My sources say no.", "Outlook not so good.", "Very doubtful."
+]
+
+@bot.hybrid_command(name="8ball", description="Ask the magic 8-ball a question")
+async def cmd_8ball(ctx: commands.Context, *, question: str):
+    if not question:
+        return await ctx.reply("Ask a full question.")
+    answer = random.choice(EIGHT_BALL)
+    await ctx.reply(f"🎱 {answer}")
+    log_command(ctx.author, "8ball", ctx.channel)
+
+@bot.hybrid_command(name="joke", description="Get a random joke")
+async def cmd_joke(ctx: commands.Context):
+    await ctx.defer()
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get("https://official-joke-api.appspot.com/jokes/random", timeout=10) as resp:
+                j = await resp.json()
+                if isinstance(j, dict):
+                    out = f"{j.get('setup')}\n{j.get('punchline')}"
+                else:
+                    out = "Couldn't fetch a joke."
+    except Exception:
+        out = "Couldn't fetch a joke."
+    await ctx.followup.send(out)
+    log_command(ctx.author, "joke", ctx.channel)
+
+@bot.hybrid_command(name="dadjoke", description="Get a dad joke")
+async def cmd_dadjoke(ctx: commands.Context):
+    await ctx.defer()
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get("https://icanhazdadjoke.com/", headers={"Accept":"application/json"}, timeout=10) as resp:
+                j = await resp.json()
+                out = j.get("joke", "No dad joke right now.")
+    except Exception:
+        out = "Couldn't fetch a dad joke."
+    await ctx.followup.send(out)
+    log_command(ctx.author, "dadjoke", ctx.channel)
+
+@bot.hybrid_command(name="coin", description="Flip a coin")
+async def cmd_coin(ctx: commands.Context):
+    await ctx.reply(random.choice(["🪙 Heads", "🪙 Tails"]))
+    log_command(ctx.author, "coin", ctx.channel)
+
+@bot.hybrid_command(name="roll", description="Roll dice: e.g., roll 1d6 or roll 20")
+async def cmd_roll(ctx: commands.Context, spec: str = "1d6"):
+    # support formats: NdM or a single max int
+    try:
+        if "d" in spec:
+            n, m = spec.lower().split("d")
+            n = max(1, min(100, int(n)))
+            m = max(1, min(1000, int(m)))
+            rolls = [random.randint(1, m) for _ in range(n)]
+            await ctx.reply(f"🎲 Rolled {spec}: {rolls} → total {sum(rolls)}")
+        else:
+            m = int(spec)
+            m = max(1, min(1000, m))
+            r = random.randint(1, m)
+            await ctx.reply(f"🎲 Rolled 1d{m}: {r}")
+    except Exception:
+        await ctx.reply("Invalid format. Use `NdM` or a number like `20`.")
+    log_command(ctx.author, "roll", ctx.channel)
+
+@bot.hybrid_command(name="rps", description="Play Rock Paper Scissors")
+async def cmd_rps(ctx: commands.Context, choice: str):
+    choice = choice.lower()
+    if choice not in ("rock","paper","scissors","r","p","s"):
+        return await ctx.reply("Choose: rock/paper/scissors")
+    mapping = {"r":"rock","p":"paper","s":"scissors"}
+    user = mapping.get(choice, choice) if choice in mapping else choice
+    bot_choice = random.choice(["rock","paper","scissors"])
+    result = "It's a tie!"
+    if user == bot_choice:
+        result = "It's a tie!"
+    elif (user=="rock" and bot_choice=="scissors") or (user=="scissors" and bot_choice=="paper") or (user=="paper" and bot_choice=="rock"):
+        result = "You win!"
+    else:
+        result = "You lose!"
+    await ctx.reply(f"You: {user} — Bot: {bot_choice} — {result}")
+    log_command(ctx.author, "rps", ctx.channel)
+
+# --------------------- Snipe navigation done earlier ---------------------
+
+# --------------------- Startup ---------------------
 if __name__ == "__main__":
-    # Ensure owner/default admins present logically even if data.json gets wiped
-    # (we do not persist DEFAULT_ADMINS into DATA file; they are implicit)
     print(f"Starting bot — owner={OWNER_ID} TZ={TZ_NAME} defaults={DEFAULT_ADMINS}")
-    # start scheduled loops
     try:
         daily_cat_loop.start()
     except RuntimeError:
@@ -1068,5 +1187,4 @@ if __name__ == "__main__":
         hourly_cat_loop.start()
     except RuntimeError:
         pass
-
     bot.run(DISCORD_BOT_TOKEN)
