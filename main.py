@@ -1,964 +1,987 @@
-# main.py - Monster Bot (combined / and ? prefix)
-# Owner ID: 1319292111325106296
-# Env vars used:
-#   DISCORD_TOKEN (required)
-#   CAT_API_KEY (optional)
-#   RENDER_API_KEY (optional, for restart_render)
-#   RENDER_SERVICE_ID (optional, for restart_render)
-#   TZ (optional, defaults to Asia/Kolkata for daily cat scheduling)
-#
-# NOTE: Set these env vars in Render or your runtime.
+# main.py
+# Monolithic Discord bot + Flask keep-alive for Render
+# Features:
+# - Prefix ? and slash commands
+# - Owner/Admin/Pookie permissions
+# - Blacklist users, blocked words (exact matches only)
+# - Logs: commands, deletes/edits, joins/leaves, moderation
+# - Warn system (permanent until removed), view/remove
+# - Auto-responder triggers (exact word; {user} -> mention)
+# - Say (no pings) / Say Admin (pings allowed for admins/pookies/owner)
+# - Purge (<=100)
+# - Cat command (TheCatAPI) + daily 11:00 IST + hourly configurable
+# - Snipe / E-Snipe with ⬅️ ➡️ buttons
+# - Role tools (give/remove/temp duration 10m/12h/4d)
+# - Ban/Kick (admin/pookie/owner)
+# - Server info, servers list (+invite attempt)
+# - Showcommands (permission-filtered, categorized)
+# - Restart Render (API), Refresh commands, Eval (owner), Debug
+# - JSON persistence
+# - Flask keep-alive server (/ and /health)
 
-import os
-import sys
-import json
-import random
-import asyncio
-import textwrap
-import traceback
-import time
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
-
-import pytz
-import aiohttp
-import logging
-import psutil
+import os, json, asyncio, re, random, logging, traceback, time, threading, math, platform
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any, List, Tuple
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
-from discord import app_commands, Interaction, Embed, AllowedMentions
 
-# simple Flask health endpoint (for Render / UptimeRobot)
-from flask import Flask
-from threading import Thread
+import aiohttp
+import psutil
+import pytz
 
-# -------------------------
-# Logging to file (so /trace_logs can read it)
-# -------------------------
-LOGFILE = "bot.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s: %(message)s",
-    handlers=[
-        logging.FileHandler(LOGFILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger("bot")
-
-# -------------------------
-# Basic config
-# -------------------------
-OWNER_ID = 1319292111325106296
-PREFIX = "?"
-DATA_FILE = "botdata.json"
-COMMANDS_META_FILE = "commands.json"
-
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+# ---------- ENV ----------
+DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")  # replace on Render
+OWNER_ID = int(os.getenv("OWNER_ID", "1319292111325106296"))
 CAT_API_KEY = os.getenv("CAT_API_KEY", "")
+TZ = os.getenv("TZ", "Asia/Kolkata")
 RENDER_API_KEY = os.getenv("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "")
-TZ_NAME = os.getenv("TZ", "Asia/Kolkata")
 
-if not DISCORD_TOKEN:
-    logger.error("DISCORD_TOKEN is not set. Exiting.")
-    sys.exit(1)
+IST = pytz.timezone(TZ)
 
-intents = discord.Intents.all()
-intents.message_content = True
+# ---------- STORAGE ----------
+DB_FILE = "data.json"
 
-# Bot that supports both prefix and slash
-bot = commands.Bot(command_prefix=commands.when_mentioned_or(PREFIX), intents=intents, help_command=None)
-tree = bot.tree
+def _default_guild_data() -> Dict[str, Any]:
+    return {
+        "admins": [],
+        "pookies": [],
+        "blacklist": [],
+        "blocked_words": [],            # exact words (case-insensitive word boundary)
+        "log_channel_id": None,
+        "logs": [],                     # list of dicts; recent first
+        "warns": {},                    # user_id -> list of warn dicts
+        "triggers": {},                 # word -> response
+        "cat_daily_channel_id": None,   # daily 11:00 IST
+        "cat_hourly": {                 # hourly auto-post
+            "enabled": False,
+            "channel_id": None,
+            "interval_hours": 1,        # default 1 hour
+            "last_sent": 0
+        },
+        "snipes": {},                   # channel_id -> list of deleted msgs
+        "esnipes": {}                   # channel_id -> list of edits
+    }
 
-ALLOW_NONE = AllowedMentions(everyone=False, roles=False, users=False)
-ALLOW_ALL  = AllowedMentions(everyone=True, roles=True, users=True)
+def load_db() -> Dict[str, Any]:
+    if not os.path.exists(DB_FILE):
+        return {"guilds": {}}
+    with open(DB_FILE, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except Exception:
+            return {"guilds": {}}
 
-# -------------------------
-# Flask health server (so Render health check / UptimeRobot works)
-# -------------------------
-app = Flask("uptime")
+def save_db():
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(DB, f, ensure_ascii=False, indent=2)
+
+def gdata(guild_id: int) -> Dict[str, Any]:
+    s = str(guild_id)
+    if s not in DB["guilds"]:
+        DB["guilds"][s] = _default_guild_data()
+        save_db()
+    return DB["guilds"][s]
+
+DB = load_db()
+
+# ---------- FLASK KEEP-ALIVE ----------
+# Render doesn't need it strictly, but you asked to include Flask.
+from flask import Flask
+app = Flask(__name__)
 
 @app.route("/")
-def home():
-    return "OK - bot is running"
+def root():
+    return "OK", 200
+
+@app.route("/health")
+def health():
+    return "healthy", 200
 
 def run_flask():
-    app.run(host="0.0.0.0", port=8080)
+    # Bind to 0.0.0.0 for Render
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), debug=False, use_reloader=False)
 
-Thread(target=run_flask, daemon=True).start()
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+flask_thread.start()
 
-# -------------------------
-# Persistence / defaults
-# -------------------------
-DEFAULT_DATA = {
-    "admins": [],           # list of user id strings
-    "pookies": [],          # list of user id strings
-    "blacklist": [],        # list of user id strings
-    "blocked_words": [],    # list of words
-    "logs": [],             # list of logs
-    "log_channel": None,    # single channel id string
-    "triggers": {},         # word -> reply
-    "daily_cat_channel": None,
-    "hourly_cat_channel": None,
-    "custom_commands": {},  # name -> reply
-    "_started_at": None
-}
+# ---------- DISCORD SETUP ----------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.guilds = True
+bot = commands.Bot(command_prefix="?", intents=intents, help_command=None)
+bot.remove_command("help")  # double-safety
 
-def ensure_file(path: str, default: Any):
-    if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(default, f, indent=4)
+bot.start_time = datetime.now(timezone.utc)
+last_error_trace = ""
 
-ensure_file(DATA_FILE, DEFAULT_DATA)
-ensure_file(COMMANDS_META_FILE, {})
+# ---------- UTILS ----------
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-def load_data() -> Dict[str, Any]:
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-    except Exception:
-        d = dict(DEFAULT_DATA)
-    # ensure keys exist
-    for k,v in DEFAULT_DATA.items():
-        if k not in d:
-            d[k] = v
-    return d
+def is_owner(user: discord.abc.User) -> bool:
+    return int(user.id) == OWNER_ID
 
-def save_data(d: Dict[str, Any]):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(d, f, indent=4)
+async def is_admin_or_pookie(user: discord.abc.User, guild: Optional[discord.Guild] = None) -> bool:
+    if is_owner(user):
+        return True
+    if guild is None:
+        return False
+    gd = gdata(guild.id)
+    return str(user.id) in gd["admins"] or str(user.id) in gd["pookies"]
 
-def load_commands_meta() -> Dict[str, Any]:
-    try:
-        with open(COMMANDS_META_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+async def is_admin_pookie_or_owner(user: discord.abc.User, guild: Optional[discord.Guild]) -> bool:
+    return await is_admin_or_pookie(user, guild) or is_owner(user)
 
-def save_commands_meta(meta: Dict[str, Any]):
-    with open(COMMANDS_META_FILE, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=4)
-
-data = load_data()
-commands_meta = load_commands_meta()
-if not commands_meta:
-    # basic metadata for showcommands
-    commands_meta = {
-        "cat": {"category":"Fun","access":"public","desc":"Random cat image"},
-        "roll": {"category":"Fun","access":"public","desc":"Roll NdM dice"},
-        "coinflip": {"category":"Fun","access":"public","desc":"Flip a coin"},
-        "eightball": {"category":"Fun","access":"public","desc":"8-ball"},
-        "joke": {"category":"Fun","access":"public","desc":"Tell a joke"},
-        "dadjoke": {"category":"Fun","access":"public","desc":"Dad joke"},
-        "rps": {"category":"Fun","access":"public","desc":"Rock paper scissors"},
-        "snipe": {"category":"Utility","access":"public","desc":"See deleted messages"},
-        "esnipe": {"category":"Utility","access":"public","desc":"See edited messages"},
-        "say": {"category":"General","access":"public","desc":"Public say (no pings)"},
-        "say_admin": {"category":"General","access":"admin","desc":"Admin say (pings allowed)"},
-        "trigger_add": {"category":"Moderation","access":"admin","desc":"Add trigger"},
-        "trigger_remove": {"category":"Moderation","access":"admin","desc":"Remove trigger"},
-        "logs": {"category":"Moderation","access":"admin","desc":"Show logs"},
-        "setdailycatchannel": {"category":"Cats","access":"admin","desc":"Set daily cat channel"},
-        "sethourlycatchannel": {"category":"Cats","access":"admin","desc":"Set hourly cat channel"},
-        "restart": {"category":"System","access":"admin","desc":"Restart by closing (Render restarts)"},
-        "restart_render": {"category":"System","access":"admin","desc":"Trigger Render deploy (restart)"},
-        "refresh_commands": {"category":"System","access":"admin","desc":"Refresh slash commands"},
-        "eval": {"category":"System","access":"owner","desc":"Owner-only eval"},
-        "debug": {"category":"System","access":"owner","desc":"Owner-only debug"},
-        "trace_logs": {"category":"System","access":"owner","desc":"Show last lines of bot.log"}
+def log_event(guild_id: int, kind: str, detail: str):
+    gd = gdata(guild_id)
+    entry = {
+        "time": now_utc().isoformat(),
+        "type": kind,
+        "detail": detail
     }
-    save_commands_meta(commands_meta)
+    gd["logs"].insert(0, entry)
+    gd["logs"] = gd["logs"][:1000]  # cap
+    save_db()
 
-# -------------------------
-# Permission helpers
-# -------------------------
-def is_owner(uid: int) -> bool:
-    return uid == OWNER_ID
+def sanitize_no_mentions(text: str) -> str:
+    # disable @mentions in normal say by inserting zero-width space
+    text = text.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+    text = re.sub(r"<@&(\d+)>", r"<@\u200b&\1>", text)
+    text = re.sub(r"<@!?(\d+)>", r"<@\u200b\1>", text)
+    return text
 
-def is_pookie(uid: int) -> bool:
-    return str(uid) in data.get("pookies", [])
+def word_boundary_match(message_content: str, word: str) -> bool:
+    # exact word match, case-insensitive
+    pattern = rfr"\b{re.escape(word)}\b"
+    return re.search(pattern, message_content, re.IGNORECASE) is not None
 
-def is_admin(uid: int) -> bool:
-    return str(uid) in data.get("admins", [])
+def parse_duration(text: str) -> Optional[int]:
+    # returns seconds from strings like 10m, 12h, 4d
+    m = re.fullmatch(r"(\d+)([smhd])", text.strip().lower())
+    if not m: return None
+    val = int(m.group(1)); unit = m.group(2)
+    mult = {"s":1, "m":60, "h":3600, "d":86400}[unit]
+    return val * mult
 
-def has_staff(uid: int) -> bool:
-    return is_owner(uid) or is_pookie(uid) or is_admin(uid)
-
-def is_blacklisted(uid: int) -> bool:
-    return str(uid) in data.get("blacklist", [])
-
-# -------------------------
-# Logging helper (appends to data["logs"] and to log file)
-# -------------------------
-def log_action(user: discord.abc.User, command_name: str, channel: Optional[discord.abc.GuildChannel]):
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    entry = {"user": f"{user} ({user.id})", "user_id": str(user.id), "command": command_name, "channel": str(channel) if channel else "DM", "time": ts}
-    data.setdefault("logs", []).append(entry)
-    if len(data["logs"]) > 2000:
-        data["logs"] = data["logs"][-2000:]
-    save_data(data)
-    logger.info(f"CMD {command_name} by {user} in {entry['channel']}")
-
-# -------------------------
-# Blocked words detection with bypass normalization
-# -------------------------
-def normalize_alnum(s: str) -> str:
-    return "".join(ch for ch in s.lower() if ch.isalnum())
-
-def contains_blocked(content: str) -> bool:
-    compact = normalize_alnum(content)
-    for w in data.get("blocked_words", []):
-        if not w: continue
-        if normalize_alnum(w) in compact:
-            return True
+async def send_cat(session: aiohttp.ClientSession, channel: discord.TextChannel):
+    # Try to fetch an image/video from TheCatAPI
+    params = {
+        "limit": 1,
+        "size": "full",
+        "mime_types": "jpg,png,gif,mp4"
+    }
+    headers = {"x-api-key": CAT_API_KEY} if CAT_API_KEY else {}
+    url = "https://api.thecatapi.com/v1/images/search"
+    try:
+        async with session.get(url, params=params, headers=headers, timeout=20) as resp:
+            data = await resp.json()
+            if isinstance(data, list) and data:
+                link = data[0].get("url")
+                if link:
+                    await channel.send(link)
+                    return True
+    except Exception as e:
+        print("Cat API error:", e)
+    # fallback fun text
+    await channel.send("Meow! 🐾 (Couldn’t fetch a cat picture right now.)")
     return False
 
-# -------------------------
-# Snipe structures
-# -------------------------
-class SnipeEntry:
-    def __init__(self, author: discord.User, content: str, time: datetime, avatar_url: str):
-        self.author = author; self.content = content; self.time = time; self.avatar_url = avatar_url
-
-class EditEntry:
-    def __init__(self, author: discord.User, before: str, after: str, time: datetime, avatar_url: str):
-        self.author = author; self.before = before; self.after = after; self.time = time; self.avatar_url = avatar_url
-
-SNIPES: Dict[int, List[SnipeEntry]] = {}
-ESNIPES: Dict[int, List[EditEntry]] = {}
-
-def push_snipe(channel_id: int, entry: SnipeEntry):
-    lst = SNIPES.setdefault(channel_id, [])
-    lst.insert(0, entry)
-    if len(lst) > 100: lst.pop()
-
-def push_esnipe(channel_id: int, entry: EditEntry):
-    lst = ESNIPES.setdefault(channel_id, [])
-    lst.insert(0, entry)
-    if len(lst) > 100: lst.pop()
-
-# pager for snipe/esnipe
-class Pager(discord.ui.View):
-    def __init__(self, kind: str, channel_id: int, index: int = 0, timeout: int = 120):
-        super().__init__(timeout=timeout)
-        self.kind = kind
-        self.channel_id = channel_id
-        self.index = index
-        self.prev = discord.ui.Button(style=discord.ButtonStyle.secondary, emoji="⬅️")
-        self.next = discord.ui.Button(style=discord.ButtonStyle.secondary, emoji="➡️")
-        self.prev.callback = self.on_prev
-        self.next.callback = self.on_next
-        self.add_item(self.prev); self.add_item(self.next)
-        self.update_buttons()
-
-    def length(self) -> int:
-        return len(SNIPES.get(self.channel_id, [])) if self.kind == "snipe" else len(ESNIPES.get(self.channel_id, []))
-
-    def update_buttons(self):
-        total = self.length()
-        if total == 0:
-            self.prev.disabled = True; self.next.disabled = True
-        else:
-            self.prev.disabled = (self.index >= total - 1)
-            self.next.disabled = (self.index <= 0)
-
-    async def on_prev(self, interaction: Interaction):
-        if self.index < self.length() - 1: self.index += 1
-        self.update_buttons()
-        embed = build_snipe_embed(self.channel_id, self.index) if self.kind == "snipe" else build_esnipe_embed(self.channel_id, self.index)
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    async def on_next(self, interaction: Interaction):
-        if self.index > 0: self.index -= 1
-        self.update_buttons()
-        embed = build_snipe_embed(self.channel_id, self.index) if self.kind == "snipe" else build_esnipe_embed(self.channel_id, self.index)
-        await interaction.response.edit_message(embed=embed, view=self)
-
-def build_snipe_embed(channel_id: int, index: int) -> Embed:
-    e = SNIPES[channel_id][index]
-    embed = Embed(title="💀 Snipe", description=e.content or "*<no content>*", color=discord.Color.red(), timestamp=e.time)
-    embed.set_author(name=str(e.author), icon_url=e.avatar_url)
-    embed.set_footer(text=f"{index+1}/{len(SNIPES[channel_id])}")
-    return embed
-
-def build_esnipe_embed(channel_id: int, index: int) -> Embed:
-    e = ESNIPES[channel_id][index]
-    desc = f"**Before:** {e.before or '*<no content>*'}\n**After:** {e.after or '*<no content>*'}"
-    embed = Embed(title="✏️ E-Snipe", description=desc, color=discord.Color.orange(), timestamp=e.time)
-    embed.set_author(name=str(e.author), icon_url=e.avatar_url)
-    embed.set_footer(text=f"{index+1}/{len(ESNIPES[channel_id])}")
-    return embed
-
-# -------------------------
-# Events
-# -------------------------
+# ---------- EVENTS ----------
 @bot.event
 async def on_ready():
-    if not data.get("_started_at"):
-        data["_started_at"] = datetime.utcnow().isoformat()
-        save_data(data)
-    logger.info(f"Logged in as {bot.user} ({bot.user.id})")
     try:
-        await tree.sync()
-        logger.info("Slash commands synced.")
+        await bot.tree.sync()
     except Exception as e:
-        logger.exception("Slash sync failed.")
-    # ensure owner is admin for convenience
-    if str(OWNER_ID) not in data.get("admins", []):
-        data.setdefault("admins", []).append(str(OWNER_ID))
-        save_data(data)
-    # start tasks
-    if not daily_cat_conditional.is_running(): daily_cat_conditional.start()
-    if not hourly_cat_task.is_running(): hourly_cat_task.start()
+        print("Slash sync error:", e)
+    print(f"Logged in as {bot.user} | {len(bot.guilds)} guilds")
+    daily_cat_loop.start()
+    hourly_cat_loop.start()
 
 @bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-    if is_blacklisted(message.author.id):
-        return
-    # blocked words check
-    if contains_blocked(message.content):
-        try:
-            await message.delete()
-        except discord.Forbidden:
-            pass
-        await message.channel.send("🚫 That word is not allowed here.", delete_after=5)
-        return
-    # triggers exact match
-    if message.guild:
-        content = message.content.strip().lower()
-        for k,v in data.get("triggers", {}).items():
-            if content == k.strip().lower():
-                response = v.replace("{user}", message.author.mention)
-                await message.channel.send(response, allowed_mentions=AllowedMentions(everyone=False, roles=False, users=True))
-                break
-    # custom commands: single-word exact match
-    if message.guild:
-        first = message.content.strip().split(" ",1)[0].lower()
-        if first in data.get("custom_commands", {}):
-            reply = data["custom_commands"][first]
-            await message.channel.send(reply.replace("{user}", message.author.mention), allowed_mentions=AllowedMentions(everyone=False, roles=False, users=True))
-            return
-    await bot.process_commands(message)
-
-@bot.event
-async def on_message_delete(message: discord.Message):
-    if not message.guild or message.author.bot: return
-    push_snipe(message.channel.id, SnipeEntry(message.author, message.content or "", datetime.utcnow(), message.author.display_avatar.url))
-
-@bot.event
-async def on_message_edit(before: discord.Message, after: discord.Message):
-    if not before.guild or before.author.bot: return
-    push_esnipe(before.channel.id, EditEntry(before.author, before.content or "", after.content or "", datetime.utcnow(), before.author.display_avatar.url))
-    if contains_blocked(after.content):
-        try: await after.delete()
-        except discord.Forbidden: pass
-        await before.channel.send("🚫 That word is not allowed here.", delete_after=5)
+async def on_guild_join(guild: discord.Guild):
+    _ = gdata(guild.id)  # ensure
+    save_db()
+    log_event(guild.id, "guild_join", f"Joined {guild.name} ({guild.id})")
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    log_action(member, "member_join", member.guild)
+    log_event(member.guild.id, "member_join", f"{member} ({member.id}) joined")
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    log_action(member, "member_leave", member.guild)
+    log_event(member.guild.id, "member_leave", f"{member} ({member.id}) left")
 
-# -------------------------
-# Cat fetching
-# -------------------------
-async def fetch_cat_url() -> Optional[str]:
-    url = "https://api.thecatapi.com/v1/images/search"
-    headers = {"x-api-key": CAT_API_KEY} if CAT_API_KEY else {}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=10) as resp:
-                if resp.status == 200:
-                    j = await resp.json()
-                    if isinstance(j, list) and j:
-                        return j[0].get("url")
-    except Exception as e:
-        logger.exception("fetch_cat_url failed")
-        return None
-    return None
+@bot.event
+async def on_message_delete(message: discord.Message):
+    if not message.guild or message.author.bot:
+        return
+    gd = gdata(message.guild.id)
+    ch_id = str(message.channel.id)
+    gd["snipes"].setdefault(ch_id, [])
+    info = {
+        "author_id": str(message.author.id),
+        "author_name": str(message.author),
+        "content": message.content,
+        "created_at": message.created_at.isoformat() if message.created_at else "",
+        "deleted_at": now_utc().isoformat(),
+        "attachments": [a.url for a in message.attachments]
+    }
+    gd["snipes"][ch_id].insert(0, info)
+    gd["snipes"][ch_id] = gd["snipes"][ch_id][:50]
+    save_db()
+    log_event(message.guild.id, "delete", f"Msg by {message.author} in #{message.channel}: {message.content[:180]}")
 
-# -------------------------
-# Tasks: daily (11:00 IST) and hourly cat
-# -------------------------
-@tasks.loop(minutes=1)
-async def daily_cat_conditional():
-    try:
-        tz = pytz.timezone(TZ_NAME)
-        now = datetime.now(tz)
-        if now.hour == 11 and now.minute == 0:
-            chid = data.get("daily_cat_channel")
-            if chid:
-                ch = bot.get_channel(int(chid))
-                if ch:
-                    url = await fetch_cat_url()
-                    if url:
-                        try: await ch.send(f"📅 **Daily Cat (11:00 IST)**\n{url}")
-                        except Exception: logger.exception("Failed send daily cat")
-    except Exception:
-        logger.exception("daily_cat_conditional error")
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if not before.guild or before.author.bot:
+        return
+    if before.content == after.content:
+        return
+    gd = gdata(before.guild.id)
+    ch_id = str(before.channel.id)
+    gd["esnipes"].setdefault(ch_id, [])
+    info = {
+        "author_id": str(before.author.id),
+        "author_name": str(before.author),
+        "before": before.content,
+        "after": after.content,
+        "edited_at": now_utc().isoformat()
+    }
+    gd["esnipes"][ch_id].insert(0, info)
+    gd["esnipes"][ch_id] = gd["esnipes"][ch_id][:50]
+    save_db()
+    log_event(before.guild.id, "edit", f"Msg edit by {before.author} in #{before.channel}")
 
-@tasks.loop(minutes=60)
-async def hourly_cat_task():
-    try:
-        chid = data.get("hourly_cat_channel")
-        if not chid: return
-        ch = bot.get_channel(int(chid))
-        if not ch: return
-        url = await fetch_cat_url()
-        if url:
-            try: await ch.send(f"⏰ **Hourly Cat**\n{url}")
-            except Exception: logger.exception("Failed send hourly cat")
-    except Exception:
-        logger.exception("hourly_cat_task error")
+@bot.event
+async def on_message(message: discord.Message):
+    # blocked words exact-word auto-delete (skip admins/pookies/owner)
+    if message.guild and not message.author.bot:
+        gd = gdata(message.guild.id)
+        if not await is_admin_pookie_or_owner(message.author, message.guild):
+            for w in gd["blocked_words"]:
+                if word_boundary_match(message.content, w):
+                    try:
+                        await message.delete()
+                        await message.channel.send(f"{message.author.mention} that word is not allowed.", delete_after=5)
+                        log_event(message.guild.id, "blocked", f"Deleted blocked word by {message.author}")
+                    except:
+                        pass
+                    return
 
-# -------------------------
-# showcommands (dynamic)
-# -------------------------
-@tree.command(name="showcommands", description="Show commands you can use (grouped by category)")
-async def slash_showcommands(interaction: Interaction):
-    meta = load_commands_meta()
-    uid = interaction.user.id
-    if is_owner(uid): level = "owner"
-    elif is_pookie(uid): level = "pookie"
-    elif is_admin(uid): level = "admin"
-    else: level = "public"
-    categories: Dict[str, List[str]] = {}
-    for cname, info in meta.items():
-        cat = info.get("category","Other"); access = info.get("access","public")
-        allowed = False
-        if access == "public": allowed = True
-        elif access == "admin" and level in ("admin","pookie","owner"): allowed = True
-        elif access == "pookie" and level in ("pookie","owner"): allowed = True
-        elif access == "owner" and level == "owner": allowed = True
-        if allowed:
-            categories.setdefault(cat, []).append(f"/{cname} — {info.get('desc','')}")
-    if not categories:
-        return await interaction.response.send_message("No commands available for you.", ephemeral=True)
-    embed = Embed(title="Available commands", color=discord.Color.blue())
-    for cat, items in categories.items():
-        embed.add_field(name=cat, value="\n".join(items[:25]), inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+        # auto-responder (exact word)
+        for trig, resp in gd["triggers"].items():
+            if word_boundary_match(message.content, trig):
+                out = resp.replace("{user}", message.author.mention)
+                await message.channel.send(out)
+                break
 
-# -------------------------
-# Say / Say_admin (slash + prefix)
-# -------------------------
-@tree.command(name="say", description="Public say (mentions disabled). Use {user} to mention author.")
-@app_commands.describe(message="Message to send")
-async def slash_say(interaction: Interaction, message: str):
-    safe = message.replace("@everyone", "everyone").replace("@here","here").replace("{user}", interaction.user.mention)
-    await interaction.response.send_message(safe, allowed_mentions=ALLOW_NONE)
-    log_action(interaction.user, "/say", interaction.channel)
+    await bot.process_commands(message)
 
-@tree.command(name="say_admin", description="Admin/pookie say (mentions allowed).")
-@app_commands.describe(message="Message to send")
-async def slash_say_admin(interaction: Interaction, message: str):
-    if not has_staff(interaction.user.id):
-        return await interaction.response.send_message("No permission.", ephemeral=True)
-    msg = message.replace("{user}", interaction.user.mention)
-    await interaction.response.send_message(msg, allowed_mentions=ALLOW_ALL)
-    log_action(interaction.user, "/say_admin", interaction.channel)
+# ---------- PERMISSION DECORATORS ----------
+def owner_only():
+    async def predicate(inter: discord.Interaction):
+        return is_owner(inter.user)
+    return app_commands.check(predicate)
 
-@bot.command(name="say")
-async def prefix_say(ctx: commands.Context, *, message: str):
-    safe = message.replace("@everyone","everyone").replace("@here","here").replace("{user}", ctx.author.mention)
-    await ctx.send(safe, allowed_mentions=ALLOW_NONE)
-    log_action(ctx.author, "?say", ctx.channel)
+def admin_or_pookie_only():
+    async def predicate(inter: discord.Interaction):
+        return await is_admin_or_pookie(inter.user, inter.guild)
+    return app_commands.check(predicate)
 
-@bot.command(name="say_admin")
-@commands.check(lambda ctx: has_staff(ctx.author.id))
-async def prefix_say_admin(ctx: commands.Context, *, message: str):
-    msg = message.replace("{user}", ctx.author.mention)
-    await ctx.send(msg, allowed_mentions=ALLOW_ALL)
-    log_action(ctx.author, "?say_admin", ctx.channel)
+# ---------- CATEGORY MAP FOR SHOWCOMMANDS ----------
+CMD_CATEGORIES = {
+    "Admin": [],
+    "Moderation": [],
+    "Utility": [],
+    "Fun": [],
+    "Cats": [],
+    "Info": [],
+    "Owner": []
+}
+def register_cmd(name: str, cat: str):
+    CMD_CATEGORIES.setdefault(cat, [])
+    if name not in CMD_CATEGORIES[cat]:
+        CMD_CATEGORIES[cat].append(name)
 
-# -------------------------
-# Fun: cat, roll, coinflip, 8ball, jokes, dadjoke, rps
-# -------------------------
-@tree.command(name="cat", description="Get a random cat image")
-async def slash_cat(interaction: Interaction):
-    url = await fetch_cat_url()
-    if not url: return await interaction.response.send_message("Couldn't fetch a cat right now 😿")
-    await interaction.response.send_message(url); log_action(interaction.user, "/cat", interaction.channel)
-
-@bot.command(name="cat")
-async def prefix_cat(ctx):
-    url = await fetch_cat_url()
-    if not url: return await ctx.send("Couldn't fetch a cat right now 😿")
-    await ctx.send(url); log_action(ctx.author, "?cat", ctx.channel)
-
-@tree.command(name="roll", description="Roll NdM (e.g., 2d6)")
-@app_commands.describe(spec="Format: NdM (e.g., 2d6)")
-async def slash_roll(interaction: Interaction, spec: str):
-    try:
-        n, m = spec.lower().split("d"); rolls = int(n); sides = int(m)
-        if rolls < 1 or sides < 1 or rolls > 50:
-            raise ValueError
-    except Exception:
-        return await interaction.response.send_message("Use format like `2d6` (1 ≤ rolls ≤ 50).", ephemeral=True)
-    results = [random.randint(1, sides) for _ in range(rolls)]
-    await interaction.response.send_message(f"🎲 Rolls: {results} → total: **{sum(results)}**"); log_action(interaction.user, f"/roll {spec}", interaction.channel)
-
-@tree.command(name="coinflip", description="Flip a coin")
-async def slash_coin(interaction: Interaction):
-    await interaction.response.send_message(random.choice(["🪙 Heads", "🪙 Tails"])); log_action(interaction.user, "/coinflip", interaction.channel)
-
-@tree.command(name="eightball", description="Ask the 8-ball")
-@app_commands.describe(question="Your question")
-async def slash_8ball(interaction: Interaction, question: str):
-    answers = ["It is certain.", "Without a doubt.", "You may rely on it.", "Most likely.", "Outlook good.", "Yes.", "Reply hazy, try again.", "Ask again later.", "Better not tell you now.", "Don't count on it.", "My reply is no.", "Very doubtful."]
-    await interaction.response.send_message(f"🎱 {random.choice(answers)}"); log_action(interaction.user, "/eightball", interaction.channel)
-
-@tree.command(name="joke", description="Get a random joke")
-async def slash_joke(interaction: Interaction):
-    jokes = ["Why did the chicken cross the road? To get to the other side!", "I told my computer I needed a break — it said 'No problem, I'll go to sleep'.", "There are 10 types of people: those who understand binary and those who don't."]
-    await interaction.response.send_message(random.choice(jokes)); log_action(interaction.user, "/joke", interaction.channel)
-
-@tree.command(name="dadjoke", description="A corny dad joke")
-async def slash_dadjoke(interaction: Interaction):
-    jokes = ["I'm reading a book on anti-gravity. It's impossible to put down!", "I used to be a baker, then I kneaded a change."]
-    await interaction.response.send_message(random.choice(jokes)); log_action(interaction.user, "/dadjoke", interaction.channel)
-
-@tree.command(name="rps", description="Rock Paper Scissors")
-@app_commands.choices(choice=[app_commands.Choice(name="rock", value="rock"), app_commands.Choice(name="paper", value="paper"), app_commands.Choice(name="scissors", value="scissors")])
-async def slash_rps(interaction: Interaction, choice: app_commands.Choice[str]):
-    c = choice.value; bot_choice = random.choice(["rock","paper","scissors"])
-    if c == bot_choice: res = "Tie!"
-    elif (c=="rock" and bot_choice=="scissors") or (c=="scissors" and bot_choice=="paper") or (c=="paper" and bot_choice=="rock"): res = "You win!"
-    else: res = "I win!"
-    await interaction.response.send_message(f"You: **{c}**, Me: **{bot_choice}** → **{res}**"); log_action(interaction.user, "/rps", interaction.channel)
-
-# -------------------------
-# Snipe / Esnipe (slash)
-# -------------------------
-@tree.command(name="snipe", description="Show deleted messages in this channel")
-async def slash_snipe(interaction: Interaction):
-    cid = interaction.channel.id
-    if cid not in SNIPES or not SNIPES[cid]:
-        return await interaction.response.send_message("Nothing to snipe here.", ephemeral=True)
-    embed = build_snipe_embed(cid, 0); view = Pager("snipe", cid)
-    await interaction.response.send_message(embed=embed, view=view); log_action(interaction.user, "/snipe", interaction.channel)
-
-@tree.command(name="esnipe", description="Show edited messages in this channel")
-async def slash_esnipe(interaction: Interaction):
-    cid = interaction.channel.id
-    if cid not in ESNIPES or not ESNIPES[cid]:
-        return await interaction.response.send_message("Nothing to esnipe here.", ephemeral=True)
-    embed = build_esnipe_embed(cid, 0); view = Pager("esnipe", cid)
-    await interaction.response.send_message(embed=embed, view=view); log_action(interaction.user, "/esnipe", interaction.channel)
-
-# -------------------------
-# Triggers (exact match)
-# -------------------------
-@tree.command(name="trigger_add", description="Admin/Pookie: add/update trigger")
-async def slash_trigger_add(interaction: Interaction, word: str, reply: str):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    data.setdefault("triggers", {})[word] = reply; save_data(data)
-    await interaction.response.send_message(f"✅ Trigger set: `{word}` → `{reply}`"); log_action(interaction.user, "/trigger_add", interaction.channel)
-
-@tree.command(name="trigger_remove", description="Admin/Pookie: remove trigger")
-async def slash_trigger_remove(interaction: Interaction, word: str):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    if word in data.get("triggers", {}):
-        data["triggers"].pop(word); save_data(data)
-        await interaction.response.send_message(f"🗑️ Removed `{word}`")
+# ---------- BASIC /showcommands ----------
+@bot.tree.command(name="showcommands", description="Show commands you can use, grouped by category.")
+async def showcommands(inter: discord.Interaction):
+    can_admin = await is_admin_or_pookie(inter.user, inter.guild)
+    is_own = is_owner(inter.user)
+    lines = []
+    for cat, cmds in CMD_CATEGORIES.items():
+        filtered = []
+        for c in cmds:
+            if cat == "Owner" and not is_own:
+                continue
+            if cat in ("Admin","Moderation") and not (can_admin or is_own):
+                continue
+            filtered.append(c)
+        if filtered:
+            lines.append(f"**{cat}**: " + ", ".join(sorted(f"/{x}" for x in filtered)))
+    if not lines:
+        await inter.response.send_message("You have no available commands.", ephemeral=True)
     else:
-        await interaction.response.send_message("No such trigger.")
-    log_action(interaction.user, "/trigger_remove", interaction.channel)
+        await inter.response.send_message("\n".join(lines), ephemeral=True)
 
-@tree.command(name="showtrigger", description="Show triggers")
-async def slash_showtrigger(interaction: Interaction):
-    if not data.get("triggers"): return await interaction.response.send_message("No triggers set.")
-    lines = [f"`{k}` → {v}" for k,v in data["triggers"].items()]
-    await interaction.response.send_message("**Triggers:**\n" + "\n".join(lines))
+register_cmd("showcommands", "Utility")
 
-# -------------------------
-# Logs & log channel
-# -------------------------
-@tree.command(name="logs", description="Show recent logs (staff only)")
-async def slash_logs(interaction: Interaction, amount: int = 10):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
+# ---------- LOG CHANNEL & VIEW ----------
+@bot.tree.command(name="setlogchannel", description="Set the log channel (Admin/Pookie/Owner).")
+@admin_or_pookie_only()
+async def setlogchannel(inter: discord.Interaction, channel: discord.TextChannel):
+    gd = gdata(inter.guild.id)
+    gd["log_channel_id"] = channel.id
+    save_db()
+    await inter.response.send_message(f"Log channel set to {channel.mention}", ephemeral=True)
+register_cmd("setlogchannel", "Admin")
+
+@bot.tree.command(name="logs", description="Show recent logs (default 10).")
+async def logs_cmd(inter: discord.Interaction, amount: Optional[int] = 10):
+    gd = gdata(inter.guild.id)
+    amount = max(1, min(50, amount or 10))
+    items = gd["logs"][:amount]
+    if not items:
+        return await inter.response.send_message("No logs yet.", ephemeral=True)
+    desc = []
+    for e in items:
+        ts = e.get("time","")
+        desc.append(f"`{ts}` **{e.get('type','?')}** — {e.get('detail','')}")
+    embed = discord.Embed(title=f"Last {len(items)} logs", description="\n".join(desc), color=discord.Color.blurple())
+    await inter.response.send_message(embed=embed, ephemeral=True)
+register_cmd("logs", "Utility")
+
+# ---------- ADMIN/POOKIE MANAGEMENT ----------
+@bot.tree.command(name="addadmin", description="Add an admin (Owner only)")
+@owner_only()
+async def addadmin(inter: discord.Interaction, user: discord.User):
+    gd = gdata(inter.guild.id)
+    if str(user.id) not in gd["admins"]:
+        gd["admins"].append(str(user.id))
+        save_db()
+    await inter.response.send_message(f"Added **{user}** as admin.", ephemeral=True)
+register_cmd("addadmin", "Owner")
+
+@bot.tree.command(name="removeadmin", description="Remove an admin (Owner only)")
+@owner_only()
+async def removeadmin(inter: discord.Interaction, user: discord.User):
+    gd = gdata(inter.guild.id)
+    if str(user.id) in gd["admins"]:
+        gd["admins"].remove(str(user.id))
+        save_db()
+    await inter.response.send_message(f"Removed **{user}** from admins.", ephemeral=True)
+register_cmd("removeadmin", "Owner")
+
+@bot.tree.command(name="listadmin", description="List admins")
+async def listadmin(inter: discord.Interaction):
+    gd = gdata(inter.guild.id)
+    if not gd["admins"]:
+        return await inter.response.send_message("No admins set.", ephemeral=True)
+    mentions = [f"<@{uid}>" for uid in gd["admins"]]
+    await inter.response.send_message("Admins: " + ", ".join(mentions))
+register_cmd("listadmin", "Info")
+
+@bot.tree.command(name="addpookie", description="Add a pookie (Owner/Admin only)")
+@admin_or_pookie_only()
+async def addpookie(inter: discord.Interaction, user: discord.User):
+    gd = gdata(inter.guild.id)
+    if str(user.id) not in gd["pookies"]:
+        gd["pookies"].append(str(user.id))
+        save_db()
+    await inter.response.send_message(f"Added **{user}** as pookie.", ephemeral=True)
+register_cmd("addpookie", "Admin")
+
+@bot.tree.command(name="removepookie", description="Remove a pookie (Owner/Admin only)")
+@admin_or_pookie_only()
+async def removepookie(inter: discord.Interaction, user: discord.User):
+    gd = gdata(inter.guild.id)
+    if str(user.id) in gd["pookies"]:
+        gd["pookies"].remove(str(user.id))
+        save_db()
+    await inter.response.send_message(f"Removed **{user}** from pookies.", ephemeral=True)
+register_cmd("removepookie", "Admin")
+
+@bot.tree.command(name="listpookie", description="List pookies")
+async def listpookie(inter: discord.Interaction):
+    gd = gdata(inter.guild.id)
+    if not gd["pookies"]:
+        return await inter.response.send_message("No pookies set.", ephemeral=True)
+    mentions = [f"<@{uid}>" for uid in gd["pookies"]]
+    await inter.response.send_message("Pookies: " + ", ".join(mentions))
+register_cmd("listpookie", "Info")
+
+# ---------- BLACKLIST & BLOCKED WORDS ----------
+@bot.tree.command(name="blacklist", description="Blacklist a user (Admin/Pookie/Owner)")
+@admin_or_pookie_only()
+async def blacklist_cmd(inter: discord.Interaction, user: discord.User):
+    gd = gdata(inter.guild.id)
+    if str(user.id) not in gd["blacklist"]:
+        gd["blacklist"].append(str(user.id))
+        save_db()
+    await inter.response.send_message(f"Blacklisted {user}.", ephemeral=True)
+register_cmd("blacklist", "Moderation")
+
+@bot.tree.command(name="unblacklist", description="Remove a user from blacklist (Admin/Pookie/Owner)")
+@admin_or_pookie_only()
+async def unblacklist_cmd(inter: discord.Interaction, user: discord.User):
+    gd = gdata(inter.guild.id)
+    if str(user.id) in gd["blacklist"]:
+        gd["blacklist"].remove(str(user.id))
+        save_db()
+    await inter.response.send_message(f"Un-blacklisted {user}.", ephemeral=True)
+register_cmd("unblacklist", "Moderation")
+
+@bot.tree.command(name="blockedword_add", description="Add a blocked word (exact match) (Admin/Pookie/Owner)")
+@admin_or_pookie_only()
+async def blockedword_add(inter: discord.Interaction, word: str):
+    gd = gdata(inter.guild.id)
+    w = word.strip().lower()
+    if w and w not in gd["blocked_words"]:
+        gd["blocked_words"].append(w)
+        save_db()
+    await inter.response.send_message(f"Added blocked word: `{w}`", ephemeral=True)
+register_cmd("blockedword_add", "Moderation")
+
+@bot.tree.command(name="blockedword_remove", description="Remove a blocked word (Admin/Pookie/Owner)")
+@admin_or_pookie_only()
+async def blockedword_remove(inter: discord.Interaction, word: str):
+    gd = gdata(inter.guild.id)
+    w = word.strip().lower()
+    if w in gd["blocked_words"]:
+        gd["blocked_words"].remove(w)
+        save_db()
+    await inter.response.send_message(f"Removed blocked word: `{w}`", ephemeral=True)
+register_cmd("blockedword_remove", "Moderation")
+
+@bot.tree.command(name="blockedword_list", description="List blocked words")
+async def blockedword_list(inter: discord.Interaction):
+    gd = gdata(inter.guild.id)
+    if not gd["blocked_words"]:
+        return await inter.response.send_message("No blocked words.", ephemeral=True)
+    await inter.response.send_message("Blocked words: " + ", ".join(f"`{w}`" for w in gd["blocked_words"]), ephemeral=True)
+register_cmd("blockedword_list", "Info")
+
+# ---------- WARNS ----------
+@bot.tree.command(name="warn", description="Warn a user (Admin/Pookie/Owner)")
+@admin_or_pookie_only()
+async def warn_cmd(inter: discord.Interaction, user: discord.User, reason: Optional[str] = "No reason"):
+    gd = gdata(inter.guild.id)
+    l = gd["warns"].setdefault(str(user.id), [])
+    w = {"by": str(inter.user.id), "reason": reason or "No reason", "time": now_utc().isoformat()}
+    l.append(w); save_db()
+    log_event(inter.guild.id, "warn", f"{user} warned by {inter.user}: {reason}")
+    await inter.response.send_message(f"Warned {user.mention}: **{reason}**")
+register_cmd("warn", "Moderation")
+
+@bot.tree.command(name="show_warns", description="Show a user's warns")
+async def show_warns(inter: discord.Interaction, user: discord.User):
+    gd = gdata(inter.guild.id)
+    lst = gd["warns"].get(str(user.id), [])
+    if not lst:
+        return await inter.response.send_message(f"{user} has no warns.", ephemeral=True)
+    lines = []
+    for i, w in enumerate(lst, 1):
+        lines.append(f"**{i}.** by <@{w['by']}> at `{w['time']}` — {w['reason']}")
+    await inter.response.send_message("\n".join(lines), ephemeral=True)
+register_cmd("show_warns", "Moderation")
+
+@bot.tree.command(name="remove_warn", description="Remove a warn by index or 'all' (Admin/Pookie/Owner)")
+@admin_or_pookie_only()
+async def remove_warn(inter: discord.Interaction, user: discord.User, index_or_all: str):
+    gd = gdata(inter.guild.id)
+    k = str(user.id)
+    if k not in gd["warns"] or not gd["warns"][k]:
+        return await inter.response.send_message("No warns found.", ephemeral=True)
+    if index_or_all.lower() == "all":
+        gd["warns"][k] = []
+        save_db()
+        return await inter.response.send_message(f"Removed all warns for {user}.", ephemeral=True)
+    if index_or_all.isdigit():
+        idx = int(index_or_all) - 1
+        if 0 <= idx < len(gd["warns"][k]):
+            removed = gd["warns"][k].pop(idx)
+            save_db()
+            return await inter.response.send_message(f"Removed warn {idx+1}: {removed['reason']}", ephemeral=True)
+    await inter.response.send_message("Invalid index.", ephemeral=True)
+register_cmd("remove_warn", "Moderation")
+
+# ---------- SAY & PURGE ----------
+@bot.tree.command(name="say", description="Make the bot say something (no pings)")
+async def say_cmd(inter: discord.Interaction, text: str):
+    out = sanitize_no_mentions(text)
+    await inter.response.send_message("✅ Sent.", ephemeral=True)
+    await inter.channel.send(out)
+register_cmd("say", "Utility")
+
+@bot.tree.command(name="say_admin", description="Admin say (mentions allowed)")
+@admin_or_pookie_only()
+async def say_admin(inter: discord.Interaction, text: str):
+    await inter.response.send_message("✅ Sent.", ephemeral=True)
+    await inter.channel.send(text, allowed_mentions=discord.AllowedMentions(everyone=True, users=True, roles=True))
+register_cmd("say_admin", "Admin")
+
+@bot.tree.command(name="purge", description="Delete recent messages (<= 100)")
+@admin_or_pookie_only()
+async def purge_cmd(inter: discord.Interaction, amount: int):
     amount = max(1, min(100, amount))
-    logs = data.get("logs", [])[-amount:]
-    if not logs: return await interaction.response.send_message("No logs yet.")
-    embed = Embed(title=f"Last {amount} logs", color=discord.Color.blue())
-    for e in logs:
-        embed.add_field(name=e["command"], value=f"{e['user']} in {e['channel']} at {e['time']}", inline=False)
-    await interaction.response.send_message(embed=embed); log_action(interaction.user, f"/logs {amount}", interaction.channel)
+    await inter.response.defer(ephemeral=True, thinking=True)
+    deleted = await inter.channel.purge(limit=amount)
+    await inter.followup.send(f"Deleted {len(deleted)} messages.", ephemeral=True)
+register_cmd("purge", "Moderation")
 
-@tree.command(name="set_log_channel", description="Admin/Pookie: set a channel to receive command logs")
-async def slash_set_log_channel(interaction: Interaction, channel: discord.TextChannel):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    data["log_channel"] = str(channel.id); save_data(data)
-    await interaction.response.send_message(f"✅ Log channel set to {channel.mention}"); log_action(interaction.user, "/set_log_channel", interaction.channel)
+# ---------- TRIGGERS ----------
+@bot.tree.command(name="trigger_add", description="Admin: add trigger: when users send WORD, bot replies with RESPONSE")
+@admin_or_pookie_only()
+async def trigger_add(inter: discord.Interaction, word: str, response: str):
+    gd = gdata(inter.guild.id)
+    gd["triggers"][word.strip().lower()] = response
+    save_db()
+    await inter.response.send_message(f"Added trigger `{word}` -> `{response}`", ephemeral=True)
+register_cmd("trigger_add", "Admin")
 
-@tree.command(name="remove_log_channel", description="Admin/Pookie: disable log channel")
-async def slash_remove_log_channel(interaction: Interaction):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    data["log_channel"] = None; save_data(data)
-    await interaction.response.send_message("🛑 Log channel mirroring disabled."); log_action(interaction.user, "/remove_log_channel", interaction.channel)
+@bot.tree.command(name="trigger_remove", description="Admin: remove trigger by exact word")
+@admin_or_pookie_only()
+async def trigger_remove(inter: discord.Interaction, word: str):
+    gd = gdata(inter.guild.id)
+    if gd["triggers"].pop(word.strip().lower(), None) is None:
+        return await inter.response.send_message("No such trigger.", ephemeral=True)
+    save_db()
+    await inter.response.send_message(f"Removed trigger `{word}`", ephemeral=True)
+register_cmd("trigger_remove", "Admin")
 
-# -------------------------
-# Admin & Pookie management
-# -------------------------
-@tree.command(name="add_admin", description="Owner: add an admin")
-async def slash_add_admin(interaction: Interaction, user: discord.User):
-    if not is_owner(interaction.user.id): return await interaction.response.send_message("Owner only.", ephemeral=True)
-    if str(user.id) not in data.get("admins", []):
-        data.setdefault("admins", []).append(str(user.id)); save_data(data)
-    await interaction.response.send_message(f"✅ {user.mention} added as admin."); log_action(interaction.user, "/add_admin", interaction.channel)
+@bot.tree.command(name="showtrigger", description="Show all triggers (exact-word)")
+async def showtrigger(inter: discord.Interaction):
+    gd = gdata(inter.guild.id)
+    if not gd["triggers"]:
+        return await inter.response.send_message("No triggers set.", ephemeral=True)
+    lines = [f"`{w}` → {r}" for w, r in gd["triggers"].items()]
+    await inter.response.send_message("\n".join(lines), ephemeral=True)
+register_cmd("showtrigger", "Utility")
 
-@tree.command(name="remove_admin", description="Owner: remove an admin")
-async def slash_remove_admin(interaction: Interaction, user: discord.User):
-    if not is_owner(interaction.user.id): return await interaction.response.send_message("Owner only.", ephemeral=True)
-    if str(user.id) in data.get("admins", []):
-        data["admins"].remove(str(user.id)); save_data(data)
-    await interaction.response.send_message(f"✅ {user.mention} removed from admin."); log_action(interaction.user, "/remove_admin", interaction.channel)
+# ---------- FUN ----------
+JOKES = [
+    "Why did the developer go broke? Because he used up all his cache.",
+    "I would tell you a UDP joke, but you might not get it.",
+    "Why do Java developers wear glasses? Because they don’t C#."
+]
+DAD_JOKES = [
+    "I used to be a baker, then I couldn't make enough dough.",
+    "I’m reading a book on anti-gravity. It’s impossible to put down!",
+    "What do you call fake spaghetti? An impasta."
+]
 
-@tree.command(name="show_admins", description="Show admins (pings)")
-async def slash_show_admins(interaction: Interaction):
-    admins = data.get("admins", [])
-    if not admins: return await interaction.response.send_message("No admins set.")
-    await interaction.response.send_message("👑 Admins:\n" + "\n".join(f"<@{a}>" for a in admins))
+@bot.tree.command(name="joke", description="Random joke")
+async def joke_cmd(inter: discord.Interaction):
+    await inter.response.send_message(random.choice(JOKES))
+register_cmd("joke", "Fun")
 
-@tree.command(name="add_pookie", description="Owner/Admin: add pookie")
-async def slash_add_pookie(interaction: Interaction, user: discord.User):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    if str(user.id) not in data.get("pookies", []):
-        data.setdefault("pookies", []).append(str(user.id)); save_data(data)
-    await interaction.response.send_message(f"✅ {user.mention} added as Pookie."); log_action(interaction.user, "/add_pookie", interaction.channel)
+@bot.tree.command(name="dadjoke", description="Random dad joke")
+async def dadjoke_cmd(inter: discord.Interaction):
+    await inter.response.send_message(random.choice(DAD_JOKES))
+register_cmd("dadjoke", "Fun")
 
-@tree.command(name="remove_pookie", description="Owner/Admin: remove pookie")
-async def slash_remove_pookie(interaction: Interaction, user: discord.User):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    if str(user.id) in data.get("pookies", []):
-        data["pookies"].remove(str(user.id)); save_data(data)
-    await interaction.response.send_message(f"✅ {user.mention} removed from Pookie."); log_action(interaction.user, "/remove_pookie", interaction.channel)
+@bot.tree.command(name="8ball", description="Magic 8-ball")
+async def eight_ball(inter: discord.Interaction, question: str):
+    answers = ["Yes.", "No.", "Maybe.", "Absolutely!", "Ask again later.", "Definitely not."]
+    await inter.response.send_message(f"🎱 {random.choice(answers)}")
+register_cmd("8ball", "Fun")
 
-@tree.command(name="list_pookie", description="List Pookie users (pings)")
-async def slash_list_pookie(interaction: Interaction):
-    pks = data.get("pookies", [])
-    if not pks: return await interaction.response.send_message("No Pookie users.")
-    await interaction.response.send_message("🍪 Pookies:\n" + "\n".join(f"<@{p}>" for p in pks))
+@bot.tree.command(name="coinflip", description="Flip a coin")
+async def coinflip(inter: discord.Interaction):
+    await inter.response.send_message("🪙 " + random.choice(["Heads", "Tails"]))
+register_cmd("coinflip", "Fun")
 
-# -------------------------
-# Moderation (ban/kick/blacklist)
-# -------------------------
-@tree.command(name="blacklist", description="Admin/Pookie: blacklist a user")
-async def slash_blacklist(interaction: Interaction, user: discord.User):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    if str(user.id) not in data.get("blacklist", []):
-        data.setdefault("blacklist", []).append(str(user.id)); save_data(data)
-    await interaction.response.send_message(f"🚫 {user.mention} blacklisted."); log_action(interaction.user, "/blacklist", interaction.channel)
+@bot.tree.command(name="rolldice", description="Roll a die (1-6)")
+async def rolldice(inter: discord.Interaction):
+    await inter.response.send_message(f"🎲 {random.randint(1,6)}")
+register_cmd("rolldice", "Fun")
 
-@tree.command(name="unblacklist", description="Admin/Pookie: remove from blacklist")
-async def slash_unblacklist(interaction: Interaction, user: discord.User):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    if str(user.id) in data.get("blacklist", []):
-        data["blacklist"].remove(str(user.id)); save_data(data)
-    await interaction.response.send_message(f"✅ {user.mention} removed from blacklist."); log_action(interaction.user, "/unblacklist", interaction.channel)
+@bot.tree.command(name="rps", description="Rock, Paper, Scissors vs bot")
+async def rps(inter: discord.Interaction, move: str):
+    move = move.lower()
+    if move not in ("rock","paper","scissors"):
+        return await inter.response.send_message("Choose one of: rock, paper, scissors", ephemeral=True)
+    botm = random.choice(["rock","paper","scissors"])
+    result = "Draw!"
+    win = {("rock","scissors"), ("scissors","paper"), ("paper","rock")}
+    if (move, botm) in win:
+        result = "You win!"
+    elif (botm, move) in win:
+        result = "I win!"
+    await inter.response.send_message(f"You: **{move}** | Me: **{botm}** → **{result}**")
+register_cmd("rps", "Fun")
 
-@tree.command(name="ban", description="Admin/Pookie: ban a member")
-async def slash_ban(interaction: Interaction, user: discord.User, reason: Optional[str] = "No reason provided"):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    if not interaction.guild: return await interaction.response.send_message("Guild only.", ephemeral=True)
+# ---------- CAT ----------
+@bot.tree.command(name="cat", description="Random cat picture/video")
+async def cat_cmd(inter: discord.Interaction):
+    await inter.response.defer(thinking=True)
+    async with aiohttp.ClientSession() as session:
+        ok = False
+        if inter.guild:
+            log_event(inter.guild.id, "cat", f"cat command by {inter.user}")
+        # fetch
+        if isinstance(inter.channel, discord.TextChannel):
+            ok = await send_cat(session, inter.channel)
+        if not ok:
+            await inter.followup.send("Couldn’t fetch a cat now.", ephemeral=True)
+        else:
+            await inter.followup.send("Meow!", ephemeral=True)
+register_cmd("cat", "Cats")
+
+@bot.tree.command(name="setdailycatchannel", description="Set channel for daily cat at 11:00 IST")
+@admin_or_pookie_only()
+async def setdailycatchannel(inter: discord.Interaction, channel: discord.TextChannel):
+    gd = gdata(inter.guild.id)
+    gd["cat_daily_channel_id"] = channel.id
+    save_db()
+    await inter.response.send_message(f"Daily cat channel set to {channel.mention}", ephemeral=True)
+register_cmd("setdailycatchannel", "Cats")
+
+@bot.tree.command(name="sethourlycatchannel", description="Enable hourly cats and choose channel + interval (hours)")
+@admin_or_pookie_only()
+async def sethourlycatchannel(inter: discord.Interaction, channel: discord.TextChannel, interval_hours: Optional[int] = 1, enabled: Optional[bool] = True):
+    gd = gdata(inter.guild.id)
+    h = gd["cat_hourly"]
+    h["channel_id"] = channel.id
+    h["interval_hours"] = max(1, min(24, interval_hours or 1))
+    h["enabled"] = bool(enabled)
+    save_db()
+    await inter.response.send_message(f"Hourly cats **{'enabled' if h['enabled'] else 'disabled'}** in {channel.mention} every {h['interval_hours']}h", ephemeral=True)
+register_cmd("sethourlycatchannel", "Cats")
+
+# ---------- CAT TASKS ----------
+@tasks.loop(minutes=1)
+async def daily_cat_loop():
+    # send at 11:00 IST (local per TZ env)
     try:
-        await interaction.guild.ban(user, reason=reason)
-        await interaction.response.send_message(f"🔨 Banned {user.mention}. Reason: {reason}")
-        log_action(interaction.user, f"/ban {user.id}", interaction.channel)
-    except discord.Forbidden:
-        await interaction.response.send_message("I don't have permission to ban that user.", ephemeral=True)
+        now_local = datetime.now(IST)
+        if now_local.hour == 11 and now_local.minute == 0:
+            async with aiohttp.ClientSession() as session:
+                for guild in bot.guilds:
+                    gd = gdata(guild.id)
+                    ch_id = gd.get("cat_daily_channel_id")
+                    if not ch_id: continue
+                    ch = guild.get_channel(ch_id)
+                    if isinstance(ch, discord.TextChannel):
+                        try:
+                            await send_cat(session, ch)
+                            log_event(guild.id, "daily_cat", f"Sent daily cat to #{ch.name}")
+                        except Exception as e:
+                            print("daily cat error:", e)
+        # don't spam: it runs every minute; only minute==0 triggers
+    except Exception as e:
+        print("daily loop error:", e)
 
-@tree.command(name="kick", description="Admin/Pookie: kick a member")
-async def slash_kick(interaction: Interaction, member: discord.Member, reason: Optional[str] = "No reason provided"):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
+@tasks.loop(minutes=1)
+async def hourly_cat_loop():
+    # multi-guild hourly scheduling
+    try:
+        now_ts = time.time()
+        async with aiohttp.ClientSession() as session:
+            for guild in bot.guilds:
+                gd = gdata(guild.id)
+                h = gd["cat_hourly"]
+                if not h["enabled"] or not h["channel_id"]:
+                    continue
+                interval = max(1, int(h.get("interval_hours", 1))) * 3600
+                last = float(h.get("last_sent", 0))
+                if now_ts - last >= interval:
+                    ch = guild.get_channel(h["channel_id"])
+                    if isinstance(ch, discord.TextChannel):
+                        try:
+                            ok = await send_cat(session, ch)
+                            if ok:
+                                h["last_sent"] = now_ts
+                                save_db()
+                                log_event(guild.id, "hourly_cat", f"Sent hourly cat to #{ch.name}")
+                        except Exception as e:
+                            print("hourly cat error:", e)
+    except Exception as e:
+        print("hourly loop fail:", e)
+
+# ---------- SNIPE / E-SNIPE ----------
+class NavView(discord.ui.View):
+    def __init__(self, items: List[Dict[str, Any]]):
+        super().__init__(timeout=60)
+        self.items_list = items
+        self.idx = 0
+
+    def format_embed(self) -> discord.Embed:
+        it = self.items_list[self.idx]
+        embed = discord.Embed(color=discord.Color.orange())
+        # Deleted
+        if "content" in it:
+            embed.title = f"🗑️ Deleted message ({self.idx+1}/{len(self.items_list)})"
+            embed.add_field(name="Author", value=f"<@{it['author_id']}> ({it['author_name']})", inline=False)
+            embed.add_field(name="Content", value=it["content"][:1024] or "(no text)", inline=False)
+            embed.add_field(name="Deleted at", value=it.get("deleted_at",""), inline=True)
+            embed.add_field(name="Sent at", value=it.get("created_at",""), inline=True)
+            if it.get("attachments"):
+                embed.add_field(name="Attachments", value="\n".join(it["attachments"][:5]), inline=False)
+        else:
+            embed.title = f"✏️ Edited message ({self.idx+1}/{len(self.items_list)})"
+            embed.add_field(name="Author", value=f"<@{it['author_id']}> ({it['author_name']})", inline=False)
+            embed.add_field(name="Before", value=(it["before"] or "(empty)")[:1024], inline=False)
+            embed.add_field(name="After", value((it["after"] or "(empty)")[:1024]) if len((it["after"] or ""))<=1024 else (it["after"] or "")[:1024], inline=False)
+            embed.add_field(name="Edited at", value=it.get("edited_at",""), inline=False)
+        return embed
+
+    @discord.ui.button(label="⬅️", style=discord.ButtonStyle.secondary)
+    async def left(self, inter: discord.Interaction, button: discord.ui.Button):
+        self.idx = (self.idx - 1) % len(self.items_list)
+        await inter.response.edit_message(embed=self.format_embed(), view=self)
+
+    @discord.ui.button(label="➡️", style=discord.ButtonStyle.secondary)
+    async def right(self, inter: discord.Interaction, button: discord.ui.Button):
+        self.idx = (self.idx + 1) % len(self.items_list)
+        await inter.response.edit_message(embed=self.format_embed(), view=self)
+
+@bot.tree.command(name="snipe", description="View recently deleted messages in this channel")
+async def snipe(inter: discord.Interaction):
+    gd = gdata(inter.guild.id)
+    items = gd["snipes"].get(str(inter.channel.id), [])
+    if not items:
+        return await inter.response.send_message("Nothing to snipe.", ephemeral=True)
+    view = NavView(items)
+    await inter.response.send_message(embed=view.format_embed(), view=view, ephemeral=True)
+register_cmd("snipe", "Utility")
+
+@bot.tree.command(name="esnipe", description="View recent message edits in this channel")
+async def esnipe(inter: discord.Interaction):
+    gd = gdata(inter.guild.id)
+    items = gd["esnipes"].get(str(inter.channel.id), [])
+    if not items:
+        return await inter.response.send_message("Nothing to e-snipe.", ephemeral=True)
+    view = NavView(items)
+    await inter.response.send_message(embed=view.format_embed(), view=view, ephemeral=True)
+register_cmd("esnipe", "Utility")
+
+# ---------- MODERATION ----------
+@bot.tree.command(name="kick", description="Kick a member (Admin/Pookie/Owner)")
+@admin_or_pookie_only()
+async def kick_cmd(inter: discord.Interaction, member: discord.Member, reason: Optional[str] = "No reason"):
     try:
         await member.kick(reason=reason)
-        await interaction.response.send_message(f"👢 Kicked {member.mention}. Reason: {reason}")
-        log_action(interaction.user, f"/kick {member.id}", interaction.channel)
-    except discord.Forbidden:
-        await interaction.response.send_message("I don't have permission to kick that member.", ephemeral=True)
-
-# -------------------------
-# Blocked words management
-# -------------------------
-@tree.command(name="add_blocked_word", description="Admin/Pookie: add blocked word")
-async def slash_add_blocked(interaction: Interaction, word: str):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    if word not in data.get("blocked_words", []):
-        data.setdefault("blocked_words", []).append(word); save_data(data)
-    await interaction.response.send_message(f"🚫 '{word}' added to blocked words."); log_action(interaction.user, "/add_blocked_word", interaction.channel)
-
-@tree.command(name="remove_blocked_word", description="Admin/Pookie: remove blocked word")
-async def slash_remove_blocked(interaction: Interaction, word: str):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    try:
-        data["blocked_words"].remove(word); save_data(data)
-        await interaction.response.send_message(f"✅ '{word}' removed.")
-    except ValueError:
-        await interaction.response.send_message("That word is not in the blocked list.")
-    log_action(interaction.user, "/remove_blocked_word", interaction.channel)
-
-@tree.command(name="show_blocked_words", description="Show blocked words")
-async def slash_show_blocked(interaction: Interaction):
-    bw = data.get("blocked_words", [])
-    if not bw: return await interaction.response.send_message("No blocked words configured.")
-    await interaction.response.send_message("🚫 Blocked words:\n" + ", ".join(f"`{w}`" for w in bw))
-
-# -------------------------
-# Cat channel setters
-# -------------------------
-@tree.command(name="setdailycatchannel", description="Admin/Pookie: set daily 11:00 IST cat channel")
-async def slash_setdailycat(interaction: Interaction, channel: discord.TextChannel):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    data["daily_cat_channel"] = str(channel.id); save_data(data)
-    await interaction.response.send_message(f"✅ Daily cat channel set to {channel.mention}"); log_action(interaction.user, "/setdailycatchannel", interaction.channel)
-
-@tree.command(name="sethourlycatchannel", description="Admin/Pookie: set hourly cat channel")
-async def slash_sethourlycat(interaction: Interaction, channel: discord.TextChannel):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    data["hourly_cat_channel"] = str(channel.id); save_data(data)
-    await interaction.response.send_message(f"✅ Hourly cat channel set to {channel.mention}"); log_action(interaction.user, "/sethourlycatchannel", interaction.channel)
-
-@tree.command(name="removehourlycatchannel", description="Admin/Pookie: disable hourly cat channel")
-async def slash_removehourlycat(interaction: Interaction):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    data["hourly_cat_channel"] = None; save_data(data)
-    await interaction.response.send_message("🛑 Hourly cat posting disabled."); log_action(interaction.user, "/removehourlycatchannel", interaction.channel)
-
-# -------------------------
-# User info & avatar
-# -------------------------
-@tree.command(name="avatar", description="Show a user's avatar")
-async def slash_avatar(interaction: Interaction, user: Optional[discord.User] = None):
-    user = user or interaction.user
-    embed = Embed(title=f"Avatar — {user}", color=discord.Color.green()); embed.set_image(url=user.display_avatar.url)
-    await interaction.response.send_message(embed=embed); log_action(interaction.user, "/avatar", interaction.channel)
-
-@tree.command(name="userinfo", description="Show a user's info")
-async def slash_userinfo(interaction: Interaction, user: Optional[discord.Member] = None):
-    if not interaction.guild: return await interaction.response.send_message("Guild only.", ephemeral=True)
-    user = user or interaction.user
-    roles = ", ".join(r.mention for r in user.roles if r.name != "@everyone")
-    embed = Embed(title=f"User Info — {user}", color=discord.Color.purple())
-    embed.add_field(name="ID", value=str(user.id), inline=False)
-    embed.add_field(name="Joined", value=str(user.joined_at) if user.joined_at else "N/A", inline=False)
-    embed.add_field(name="Created", value=str(user.created_at), inline=False)
-    embed.add_field(name="Roles", value=roles or "None", inline=False)
-    embed.set_thumbnail(url=user.display_avatar.url)
-    await interaction.response.send_message(embed=embed); log_action(interaction.user, "/userinfo", interaction.channel)
-
-# -------------------------
-# Restart commands
-# -------------------------
-@tree.command(name="restart", description="Restart bot by closing process (Render will restart it)")
-async def slash_restart(interaction: Interaction):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    await interaction.response.send_message("🔄 Restarting bot (closing process)...", ephemeral=True)
-    log_action(interaction.user, "/restart", interaction.channel)
-    await bot.close()
-
-@tree.command(name="restart_render", description="Trigger Render deploy (requires RENDER_API_KEY & RENDER_SERVICE_ID)")
-async def slash_restart_render(interaction: Interaction):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    if not RENDER_API_KEY or not RENDER_SERVICE_ID:
-        return await interaction.response.send_message("Render API credentials not configured.", ephemeral=True)
-    url = f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/deploys"
-    headers = {"Authorization": f"Bearer {RENDER_API_KEY}", "Accept":"application/json", "Content-Type":"application/json"}
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json={}) as resp:
-            text = await resp.text()
-            if resp.status in (200,201,202):
-                await interaction.response.send_message("🔄 Render deploy triggered. Service will restart.", ephemeral=True)
-            else:
-                await interaction.response.send_message(f"❌ Failed to trigger deploy: {resp.status}\n{text}", ephemeral=True)
-    log_action(interaction.user, "/restart_render", interaction.channel)
-
-# -------------------------
-# Refresh commands (resync slash)
-# -------------------------
-@tree.command(name="refresh_commands", description="Force-refresh slash commands with Discord")
-async def slash_refresh_commands(interaction: Interaction):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    try:
-        await bot.tree.sync(); await interaction.response.send_message("✅ Commands refreshed with Discord.", ephemeral=True); log_action(interaction.user, "/refresh_commands", interaction.channel)
+        log_event(inter.guild.id, "kick", f"{member} kicked by {inter.user}: {reason}")
+        await inter.response.send_message(f"Kicked {member} — {reason}")
     except Exception as e:
-        await interaction.response.send_message(f"❌ Error refreshing: {e}", ephemeral=True)
+        await inter.response.send_message(f"Error: {e}", ephemeral=True)
+register_cmd("kick", "Moderation")
 
-# -------------------------
-# Eval, debug, trace_logs (owner/pookie)
-# -------------------------
-def is_owner_or_pookie(user_id: int) -> bool:
-    return is_owner(user_id) or is_pookie(user_id)
-
-@tree.command(name="debug", description="Owner/pookie: show bot debug info")
-async def slash_debug(interaction: Interaction):
-    if not is_owner_or_pookie(interaction.user.id):
-        return await interaction.response.send_message("No permission.", ephemeral=True)
-    started_iso = data.get("_started_at")
-    started = datetime.fromisoformat(started_iso) if started_iso else datetime.utcnow()
-    uptime = datetime.utcnow() - started
+@bot.tree.command(name="ban", description="Ban a member (Admin/Pookie/Owner)")
+@admin_or_pookie_only()
+async def ban_cmd(inter: discord.Interaction, member: discord.Member, reason: Optional[str] = "No reason"):
     try:
-        p = psutil.Process(os.getpid())
-        mem = f"{p.memory_info().rss/1024**2:.2f} MB"
-        cpu = f"{psutil.cpu_percent(interval=0.1):.2f}%"
+        await member.ban(reason=reason, delete_message_days=0)
+        log_event(inter.guild.id, "ban", f"{member} banned by {inter.user}: {reason}")
+        await inter.response.send_message(f"Banned {member} — {reason}")
+    except Exception as e:
+        await inter.response.send_message(f"Error: {e}", ephemeral=True)
+register_cmd("ban", "Moderation")
+
+@bot.tree.command(name="giverole", description="Give a role to a user (Admin/Pookie/Owner)")
+@admin_or_pookie_only()
+async def giverole(inter: discord.Interaction, member: discord.Member, role: discord.Role):
+    try:
+        await member.add_roles(role, reason=f"by {inter.user}")
+        log_event(inter.guild.id, "giverole", f"{role.name} → {member}")
+        await inter.response.send_message(f"Gave **{role.name}** to {member}.")
+    except Exception as e:
+        await inter.response.send_message(f"Error: {e}", ephemeral=True)
+register_cmd("giverole", "Moderation")
+
+@bot.tree.command(name="removerole", description="Remove a role from a user (Admin/Pookie/Owner)")
+@admin_or_pookie_only()
+async def removerole(inter: discord.Interaction, member: discord.Member, role: discord.Role):
+    try:
+        await member.remove_roles(role, reason=f"by {inter.user}")
+        log_event(inter.guild.id, "removerole", f"{role.name} x {member}")
+        await inter.response.send_message(f"Removed **{role.name}** from {member}.")
+    except Exception as e:
+        await inter.response.send_message(f"Error: {e}", ephemeral=True)
+register_cmd("removerole", "Moderation")
+
+@bot.tree.command(name="temprole", description="Give a temporary role (e.g., 10m/12h/4d)")
+@admin_or_pookie_only()
+async def temprole(inter: discord.Interaction, member: discord.Member, role: discord.Role, duration: str):
+    secs = parse_duration(duration)
+    if not secs:
+        return await inter.response.send_message("Use duration like `10m`, `12h`, `4d`.", ephemeral=True)
+    try:
+        await member.add_roles(role, reason=f"temp by {inter.user} for {duration}")
+        await inter.response.send_message(f"Gave **{role.name}** to {member} for {duration}.")
+        async def remove_later():
+            await asyncio.sleep(secs)
+            try:
+                await member.remove_roles(role, reason="temp expired")
+            except: pass
+        bot.loop.create_task(remove_later())
+    except Exception as e:
+        await inter.response.send_message(f"Error: {e}", ephemeral=True)
+register_cmd("temprole", "Moderation")
+
+# ---------- SERVER INFO ----------
+@bot.tree.command(name="serverinfo", description="Detailed server information")
+async def serverinfo(inter: discord.Interaction):
+    g = inter.guild
+    if not g:
+        return await inter.response.send_message("Not in a guild.", ephemeral=True)
+    text_channels = len([c for c in g.channels if isinstance(c, discord.TextChannel)])
+    voice_channels = len([c for c in g.channels if isinstance(c, discord.VoiceChannel)])
+    categories = len([c for c in g.channels if isinstance(c, discord.CategoryChannel)])
+    roles = len(g.roles)
+    features = ", ".join(g.features) if g.features else "None"
+    verification = str(g.verification_level).title()
+    explicit = str(g.explicit_content_filter).title()
+    boosts = g.premium_subscription_count or 0
+    owner = g.owner or (await g.fetch_owner())
+    embed = discord.Embed(title=f"{g.name}", color=discord.Color.blurple())
+    embed.add_field(name="Owner", value=f"{owner} ({owner.id})", inline=False)
+    embed.add_field(name="Created", value=g.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"), inline=True)
+    embed.add_field(name="Members", value=str(g.member_count or "?"), inline=True)
+    embed.add_field(name="Text/Voice/Categories", value=f"{text_channels}/{voice_channels}/{categories}", inline=True)
+    embed.add_field(name="Roles", value=str(roles), inline=True)
+    embed.add_field(name="Verification", value=verification, inline=True)
+    embed.add_field(name="Filter", value=explicit, inline=True)
+    embed.add_field(name="Boosts", value=str(boosts), inline=True)
+    embed.add_field(name="Features", value=features, inline=False)
+    if g.icon:
+        embed.set_thumbnail(url=g.icon.url)
+    await inter.response.send_message(embed=embed)
+register_cmd("serverinfo", "Info")
+
+@bot.tree.command(name="servers", description="List servers the bot is in")
+async def servers(inter: discord.Interaction):
+    rows = []
+    for g in bot.guilds:
+        owner = g.owner or (await g.fetch_owner())
+        rows.append(f"**{g.name}** (`{g.id}`) — Owner: {owner} — Members: {g.member_count}")
+    msg = "\n".join(rows) if rows else "No servers."
+    await inter.response.send_message(msg, ephemeral=True)
+register_cmd("servers", "Info")
+
+# ---------- OWNER / UTILS ----------
+@bot.tree.command(name="refresh", description="Refresh (sync) slash commands (Owner)")
+@owner_only()
+async def refresh(inter: discord.Interaction):
+    await bot.tree.sync()
+    await inter.response.send_message("Commands refreshed.", ephemeral=True)
+register_cmd("refresh", "Owner")
+
+@bot.tree.command(name="restart_render", description="Trigger a deploy/restart on Render (Owner)")
+@owner_only()
+async def restart_render(inter: discord.Interaction):
+    if not (RENDER_API_KEY and RENDER_SERVICE_ID):
+        return await inter.response.send_message("RENDER_API_KEY or RENDER_SERVICE_ID not set.", ephemeral=True)
+    await inter.response.defer(ephemeral=True, thinking=True)
+    import base64, json as _json
+    # Render API: POST /v1/services/{serviceId}/deploys
+    async with aiohttp.ClientSession() as sess:
+        url = f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/deploys"
+        headers = {"Authorization": f"Bearer {RENDER_API_KEY}", "Content-Type": "application/json"}
+        payload = {"clearCache": True}
+        try:
+            async with sess.post(url, headers=headers, json=payload, timeout=30) as r:
+                txt = await r.text()
+                await inter.followup.send(f"Render deploy requested. Status {r.status}:\n```json\n{txt[:1900]}\n```", ephemeral=True)
+        except Exception as e:
+            await inter.followup.send(f"Error: {e}", ephemeral=True)
+register_cmd("restart_render", "Owner")
+
+@bot.tree.command(name="eval", description="Owner-only Python eval")
+@owner_only()
+async def eval_cmd(inter: discord.Interaction, code: str):
+    global last_error_trace
+    env = {
+        "bot": bot, "discord": discord, "asyncio": asyncio,
+        "inter": inter, "DB": DB, "gdata": gdata, "now_utc": now_utc
+    }
+    try:
+        result = eval(code, env, env)
+        if asyncio.iscoroutine(result):
+            result = await result
+        await inter.response.send_message(f"```py\n{result}\n```", ephemeral=True)
     except Exception:
-        mem = "N/A"; cpu = "N/A"
-    embed = Embed(title="Bot Debug", color=discord.Color.green())
-    embed.add_field(name="Uptime", value=str(uptime).split(".")[0], inline=False)
-    embed.add_field(name="Guilds", value=str(len(bot.guilds)), inline=True)
-    embed.add_field(name="Users (approx)", value=str(sum(g.member_count for g in bot.guilds)), inline=True)
-    embed.add_field(name="Latency", value=f"{round(bot.latency*1000)} ms", inline=True)
-    embed.add_field(name="Memory", value=mem, inline=True)
-    embed.add_field(name="CPU", value=cpu, inline=True)
-    await interaction.response.send_message(embed=embed, ephemeral=True); log_action(interaction.user, "/debug", interaction.channel)
+        last_error_trace = traceback.format_exc()
+        await inter.response.send_message(f"```py\n{last_error_trace[-1800:]}\n```", ephemeral=True)
+register_cmd("eval", "Owner")
 
-@tree.command(name="eval", description="Owner-only: evaluate Python code (use carefully!)")
-@app_commands.describe(code="Python code to evaluate (supports await)")
-async def slash_eval(interaction: Interaction, *, code: str):
-    if not is_owner(interaction.user.id):
-        return await interaction.response.send_message("Owner only.", ephemeral=True)
-    code = code.strip("` \n")
-    wrapped = "async def __aexec():\n" + textwrap.indent(code, "    ")
-    env = {"bot": bot, "discord": discord, "commands": commands, "asyncio": asyncio, "aiohttp": aiohttp, "data": data, "save_data": save_data}
-    str_out = ""
-    try:
-        exec(wrapped, env)
-        func = env["__aexec"]
-        start = time.perf_counter()
-        result = await asyncio.wait_for(func(), timeout=8.0)
-        duration = (time.perf_counter() - start) * 1000
-        str_out = f"Result (took {duration:.2f}ms):\n{repr(result)}"
-    except asyncio.TimeoutError:
-        str_out = "Execution timed out (8s)."
-    except Exception:
-        str_out = traceback.format_exc()
-    if len(str_out) > 1900:
-        fn = f"eval_{int(time.time())}.txt"
-        with open(fn, "w", encoding="utf-8") as f:
-            f.write(str_out)
-        await interaction.response.send_message("Output too long, sending file.", ephemeral=True)
-        await interaction.followup.send(file=discord.File(fn))
-        try: os.remove(fn)
-        except Exception: pass
-    else:
-        await interaction.response.send_message(f"```py\n{str_out}\n```", ephemeral=True)
-    log_action(interaction.user, "/eval", interaction.channel)
+@bot.tree.command(name="trace", description="Show last error trace (Owner)")
+@owner_only()
+async def trace_cmd(inter: discord.Interaction):
+    if not last_error_trace:
+        return await inter.response.send_message("No trace stored.", ephemeral=True)
+    await inter.response.send_message(f"```py\n{last_error_trace[-1900:]}\n```", ephemeral=True)
+register_cmd("trace", "Owner")
 
-@tree.command(name="trace_logs", description="Owner/pookie: show last lines of the bot log")
-async def slash_trace_logs(interaction: Interaction, lines: int = 20):
-    if not is_owner_or_pookie(interaction.user.id):
-        return await interaction.response.send_message("No permission.", ephemeral=True)
-    try:
-        with open(LOGFILE, "r", encoding="utf-8") as f:
-            all_lines = f.readlines()[-max(1, min(500, lines)):]
-        content = "".join(all_lines)
-    except FileNotFoundError:
-        return await interaction.response.send_message("No log file found.", ephemeral=True)
-    if len(content) > 1900:
-        import io
-        with io.StringIO(content) as file:
-            await interaction.response.send_message("Logs are long — sending as file.", ephemeral=True)
-            await interaction.followup.send(file=discord.File(file, "trace_logs.txt"))
-    else:
-        await interaction.response.send_message(f"```log\n{content}\n```", ephemeral=True)
-    log_action(interaction.user, "/trace_logs", interaction.channel)
+@bot.tree.command(name="debug", description="Show bot/system debug info")
+async def debug_cmd(inter: discord.Interaction):
+    if not await is_admin_pookie_or_owner(inter.user, inter.guild):
+        return await inter.response.send_message("No permission.", ephemeral=True)
+    # uptime
+    delta = now_utc() - bot.start_time
+    uptime = str(delta).split(".")[0]
+    process = psutil.Process(os.getpid())
+    cpu = psutil.cpu_percent()
+    mem = round(process.memory_info().rss / (1024**2), 2)
+    guild_count = len(bot.guilds)
+    members = sum((g.member_count or 0) for g in bot.guilds)
+    commands_loaded = len(bot.tree.get_commands())
+    ping = round(bot.latency*1000)
+    embed = discord.Embed(title="🛠 Debug", color=discord.Color.green(), timestamp=now_utc())
+    embed.add_field(name="Uptime", value=uptime)
+    embed.add_field(name="Ping", value=f"{ping}ms")
+    embed.add_field(name="Guilds", value=str(guild_count))
+    embed.add_field(name="Members", value=str(members))
+    embed.add_field(name="Commands", value=str(commands_loaded))
+    embed.add_field(name="CPU", value=f"{cpu}%")
+    embed.add_field(name="Memory", value=f"{mem} MB")
+    embed.add_field(name="Timezone", value=TZ)
+    embed.add_field(name="Owner ID", value=str(OWNER_ID))
+    embed.add_field(name="Render API", value=("Configured ✅" if RENDER_API_KEY else "Not set ❌"))
+    embed.add_field(name="Python", value=platform.python_version())
+    embed.add_field(name="discord.py", value=discord.__version__)
+    await inter.response.send_message(embed=embed, ephemeral=True)
+register_cmd("debug", "Owner")
 
-# -------------------------
-# Custom commands + interactive Add Modal
-# -------------------------
-class AddCmdModal(discord.ui.Modal, title="Add Custom Command"):
-    name_input = discord.ui.TextInput(label="Command name (single word)", placeholder="hello", max_length=50)
-    response_input = discord.ui.TextInput(label="Response (use {user} to mention)", style=discord.TextStyle.paragraph, max_length=2000)
-    def __init__(self, invoking_user_id: int):
-        super().__init__()
-        self.invoking_user_id = invoking_user_id
-    async def on_submit(self, interaction: Interaction):
-        if not has_staff(interaction.user.id):
-            return await interaction.response.send_message("No permission.", ephemeral=True)
-        name = self.name_input.value.strip().lower()
-        if not name.isalnum():
-            return await interaction.response.send_message("Name must be alphanumeric (no spaces).", ephemeral=True)
-        data.setdefault("custom_commands", {})[name] = self.response_input.value
-        save_data(data)
-        await interaction.response.send_message(f"✅ Custom command `{name}` added.", ephemeral=True)
-        log_action(interaction.user, "/add_custom_via_modal", interaction.channel)
+# ---------- PREFIX MIRRORS (popular ones) ----------
+@bot.command(name="say")
+async def p_say(ctx: commands.Context, *, text: str):
+    out = sanitize_no_mentions(text)
+    await ctx.reply("✅ Sent.", delete_after=3, mention_author=False)
+    await ctx.send(out)
 
-class AddCmdView(discord.ui.View):
-    @discord.ui.button(label="Add custom command", style=discord.ButtonStyle.green)
-    async def add_button(self, button: discord.ui.Button, interaction: Interaction):
-        if not has_staff(interaction.user.id):
-            return await interaction.response.send_message("No permission.", ephemeral=True)
-        modal = AddCmdModal(interaction.user.id)
-        await interaction.response.send_modal(modal)
-
-@tree.command(name="open_add_command", description="Open a button to add custom commands (Admin/Pookie only)")
-async def slash_open_add_command(interaction: Interaction):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    view = AddCmdView(); await interaction.response.send_message("Click to add a custom command (admin/pookie only).", view=view, ephemeral=True)
-
-@tree.command(name="add_custom_command", description="Admin/Pookie: add custom command")
-async def slash_add_custom(interaction: Interaction, name: str, response: str):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    name = name.strip().lower(); data.setdefault("custom_commands", {})[name] = response; save_data(data)
-    await interaction.response.send_message(f"✅ Custom command `{name}` added."); log_action(interaction.user, "/add_custom_command", interaction.channel)
-
-@tree.command(name="remove_custom_command", description="Admin/Pookie: remove custom command")
-async def slash_remove_custom(interaction: Interaction, name: str):
-    if not has_staff(interaction.user.id): return await interaction.response.send_message("No permission.", ephemeral=True)
-    name = name.strip().lower()
-    if name in data.get("custom_commands", {}):
-        data["custom_commands"].pop(name); save_data(data)
-        await interaction.response.send_message(f"🗑️ Removed custom command `{name}`.")
-    else:
-        await interaction.response.send_message("No such custom command.")
-    log_action(interaction.user, f"/remove_custom_command {name}", interaction.channel)
-
-@tree.command(name="list_custom_commands", description="List custom commands")
-async def slash_list_custom(interaction: Interaction):
-    cc = data.get("custom_commands", {})
-    if not cc: return await interaction.response.send_message("No custom commands set.")
-    lines = [f"`{k}` → {v[:100]}{'...' if len(v)>100 else ''}" for k,v in cc.items()]
-    await interaction.response.send_message("Custom commands:\n" + "\n".join(lines)); log_action(interaction.user, "/list_custom_commands", interaction.channel)
-
-# -------------------------
-# Prefix versions: purge (example), say already above, etc.
-# -------------------------
 @bot.command(name="purge")
 @commands.has_permissions(manage_messages=True)
-async def prefix_purge(ctx: commands.Context, amount: int):
+async def p_purge(ctx: commands.Context, amount: int):
     amount = max(1, min(100, amount))
-    deleted = await ctx.channel.purge(limit=amount+1)
-    await ctx.send(f"🧹 Deleted {len(deleted)-1} messages.", delete_after=5)
-    log_action(ctx.author, f"?purge {amount}", ctx.channel)
+    deleted = await ctx.channel.purge(limit=amount)
+    await ctx.send(f"Deleted {len(deleted)} messages.", delete_after=5)
 
-# -------------------------
-# Error handling
-# -------------------------
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ You don't have permission for this command.")
-    elif isinstance(error, commands.CheckFailure):
-        await ctx.send("❌ Check failed (permissions).")
-    else:
-        logger.exception("Unhandled command error")
-        await ctx.send("❌ An error occurred. Check bot logs.")
+@bot.command(name="snipe")
+async def p_snipe(ctx: commands.Context):
+    gd = gdata(ctx.guild.id)
+    items = gd["snipes"].get(str(ctx.channel.id), [])
+    if not items:
+        return await ctx.reply("Nothing to snipe.", mention_author=False)
+    it = items[0]
+    embed = discord.Embed(title="🗑️ Deleted", color=discord.Color.orange())
+    embed.add_field(name="Author", value=f"<@{it['author_id']}> ({it['author_name']})", inline=False)
+    embed.add_field(name="Content", value=it["content"][:1024] or "(no text)", inline=False)
+    await ctx.send(embed=embed)
 
-# -------------------------
-# Ensure owner in admins on start
-# -------------------------
+@bot.command(name="cat")
+async def p_cat(ctx: commands.Context):
+    async with aiohttp.ClientSession() as session:
+        await send_cat(session, ctx.channel)
+
+# ---------- RUN ----------
 if __name__ == "__main__":
-    # ensure owner is admin
-    if str(OWNER_ID) not in data.get("admins", []):
-        data.setdefault("admins", []).append(str(OWNER_ID)); save_data(data)
-    if not data.get("_started_at"):
-        data["_started_at"] = datetime.utcnow().isoformat(); save_data(data)
-    # run bot
+    # Friendly startup print
+    print("Starting bot with Flask keep-alive…")
+    # Login
     bot.run(DISCORD_TOKEN)
