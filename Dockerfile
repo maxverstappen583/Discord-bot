@@ -1,27 +1,20 @@
-# Use the official lightweight Python image
+# Use Python 3.11 base image
 FROM python:3.11-slim
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
-
-# Set work directory
+# Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python dependencies
+# Copy requirements first (better caching)
 COPY requirements.txt .
+
+# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy project files
+# Copy bot files
 COPY . .
 
-# Expose Flask port
-EXPOSE 8080
+# Expose Flask port (Render expects 10000 by default)
+EXPOSE 10000
 
-# Run bot
+# Start both Flask and the bot
 CMD ["python", "main.py"]
