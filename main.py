@@ -1,166 +1,162 @@
-# main.py
-# Full single-file Discord bot with Flask keepalive (Render-ready)
-# Features included (summary):
-# - Prefix "?" and slash "/" commands
-# - Owner/Admin/Pookie systems (owner ID from env, defaults to your ID)
-# - Blacklist and blocked-words with bypass protection
-# - AFK system (notify when mentioned) and /afk, ?afk
-# - Triggers (exact-word auto-responder) add/remove/show
-# - Snipe / Esnipe (deleted & edited messages) with ⬅️/➡️ buttons
-# - Cat commands: /cat, ?cat, set daily 11:00 IST channel, set hourly channel
-# - Logging: set_log_channel, disable_log_channel, logs (view)
-# - Moderation: /ban (member), ?ban (ID or mention), /kick, ?kick, purge
-# - Say (no pings) and say_admin (pings allowed)
-# - Showcommands interactive (shows only commands user can use)
-# - Askforcommand to notify owner via DM and log
-# - Restart (exit process) & refresh commands (sync)
-# - JSON single-file persistence: data.json
-# - Flask keepalive on port from environment or 8080
-# - Starts tasks inside on_ready to avoid "no running event loop" error
+# main.py — Full single-file Discord bot with Flask + Render restart support.
+# Requirements (put in requirements.txt): discord.py>=2.2.0, aiohttp, flask
+# Env vars required: DISCORD_BOT_TOKEN
+# Optional env vars: OWNER_ID, CAT_API_KEY, RENDER_API_KEY, RENDER_SERVICE_ID, TZ, PORT
 
-import os, json, re, random, asyncio, atexit, sys, platform, secrets
-from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
-from threading import Thread
-from typing import Optional, List, Dict, Any
-
+import os
+import json
+import re
+import random
+import asyncio
 import aiohttp
+import atexit
+import sys
+from datetime import datetime, timezone, timedelta
+from threading import Thread
+from zoneinfo import ZoneInfo
+from typing import Optional, Dict, Any, List
+
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from flask import Flask
 
-# ------------------------- ENV & CONFIG -------------------------
+# -------------------------
+# ENV / CONFIG
+# -------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 if not DISCORD_TOKEN:
-    raise RuntimeError("DISCORD_BOT_TOKEN not set in environment variables")
+    raise RuntimeError("DISCORD_BOT_TOKEN environment variable not set")
 
-def _int_env(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except Exception:
-        # try to extract digits if user pasted "OWNER_ID = 123"
-        digits = "".join(ch for ch in raw if ch.isdigit())
-        if digits:
-            return int(digits)
-        return default
+try:
+    OWNER_ID = int(os.getenv("OWNER_ID", "1319292111325106296").strip())
+except Exception:
+    OWNER_ID = 1319292111325106296
 
-OWNER_ID = _int_env("OWNER_ID", 1319292111325106296)  # your default owner id
-# add extra default admin IDs requested earlier
+# extra default admins you requested earlier (keeps you and them admins by default)
 DEFAULT_EXTRA_ADMINS = {1380315427992768633, 909468887098216499}
 
 CAT_API_KEY = os.getenv("CAT_API_KEY", "").strip()
 RENDER_API_KEY = os.getenv("RENDER_API_KEY", "").strip()
 RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "").strip()
-TZ_NAME = os.getenv("TZ", "Asia/Kolkata").strip() or "Asia/Kolkata"
 
+TZ_NAME = os.getenv("TZ", "Asia/Kolkata").strip() or "Asia/Kolkata"
 try:
     BOT_TZ = ZoneInfo(TZ_NAME)
 except Exception:
     BOT_TZ = ZoneInfo("Asia/Kolkata")
 
-PREFIX = "?"
-DATA_FILE = "data.json"
+FLASK_PORT = int(os.getenv("PORT", os.getenv("FLASK_PORT", "8080")))
+
+DATA_FILE = "bot_data.json"
 SNIPES_KEEP = 50
 LOGS_KEEP = 2000
 
-# ------------------------- FLASK KEEPALIVE -------------------------
-FLASK_PORT = int(os.getenv("PORT", "8080"))
-flask_app = Flask("bot_keepalive")
+# -------------------------
+# FLASK KEEPALIVE THREAD
+# -------------------------
+app = Flask("bot_keepalive")
 
-@flask_app.route("/")
-def alive():
+
+@app.route("/")
+def _alive():
     return "OK", 200
 
-def run_flask():
-    # run in separate thread to not block bot
-    flask_app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False)
 
-Thread(target=run_flask, daemon=True).start()
+def _run_flask():
+    # run flask in a thread so bot.run() can run in main thread
+    app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False)
 
-# ------------------------- BOT SETUP -------------------------
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-intents.guilds = True
-intents.messages = True
 
-bot = commands.Bot(command_prefix=commands.when_mentioned_or(PREFIX), intents=intents, help_command=None)
-tree = bot.tree
+Thread(target=_run_flask, daemon=True).start()
 
-# ------------------------- STORAGE -------------------------
+# -------------------------
+# PERSISTENT JSON STORAGE
+# -------------------------
 DEFAULT_DATA = {
-    "admins": [],              # list of user ids (int)
-    "pookies": [],             # list of user ids (int)
-    "blacklist": [],           # list of user ids (int)
-    "blocked_words": [],       # list of strings
-    "triggers": {},            # word -> reply
-    "log_channel": None,       # int or None
-    "cat_channel": None,       # daily 11:00 IST channel id
-    "hourly_cat_channel": None,# hourly channel id
-    "logs": [],                # list of log entries (dict)
-    "afk": {}                  # user_id (str) -> {"reason": str, "since": iso}
+    "admins": [],  # list of ints
+    "pookies": [],
+    "blacklist": [],
+    "blocked_words": [],
+    "triggers": {},  # word -> reply
+    "log_channel": None,
+    "cat_channel": None,  # daily 11:00 IST
+    "hourly_cat_channel": None,
+    "logs": [],
+    "afk": {}
 }
 
-def _init_data():
-    if not os.path.exists(DATA_FILE):
-        data = DEFAULT_DATA.copy()
-        # default admins: owner + extras
-        data["admins"] = list({OWNER_ID} | DEFAULT_EXTRA_ADMINS)
-        save_data(data)
-    return load_data()
+
+def save_data(d: Dict[str, Any]):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+
 
 def load_data() -> Dict[str, Any]:
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-    except Exception:
+    if not os.path.exists(DATA_FILE):
         d = DEFAULT_DATA.copy()
-    # ensure keys
+        # set default admins (owner + extras)
+        d["admins"] = list({OWNER_ID} | DEFAULT_EXTRA_ADMINS)
+        save_data(d)
+        return d
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    # ensure keys exist
     for k, v in DEFAULT_DATA.items():
         if k not in d:
             d[k] = v.copy() if isinstance(v, (list, dict)) else v
-    # ensure owner and default extras in admins
+    # ensure owner present
     admins = set(map(int, d.get("admins", [])))
     admins.add(OWNER_ID)
     admins |= DEFAULT_EXTRA_ADMINS
     d["admins"] = list(admins)
     return d
 
-def save_data(d: Dict[str, Any]):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(d, f, indent=2, ensure_ascii=False)
 
-DATA = _init_data()
+DATA = load_data()
+
 
 def reload_data():
     global DATA
     DATA = load_data()
     return DATA
 
-# ------------------------- UTILITIES -------------------------
-def is_owner(u: discord.abc.User) -> bool:
-    return int(u.id) == int(OWNER_ID)
 
-def is_admin_user(u: discord.abc.User) -> bool:
-    d = reload_data()
-    return int(u.id) in set(map(int, d.get("admins", []))) or is_owner(u)
+atexit.register(lambda: save_data(DATA))
 
-def is_pookie_user(u: discord.abc.User) -> bool:
-    d = reload_data()
-    return int(u.id) in set(map(int, d.get("pookies", []))) or is_admin_user(u)
+# -------------------------
+# HELPERS
+# -------------------------
+def is_owner(u_id: int) -> bool:
+    return int(u_id) == int(OWNER_ID)
 
-def is_blacklisted_user(u: discord.abc.User) -> bool:
+
+def is_admin_user(u_id: int) -> bool:
     d = reload_data()
-    return int(u.id) in set(map(int, d.get("blacklist", [])))
+    return int(u_id) in set(map(int, d.get("admins", []))) or is_owner(u_id)
+
+
+def is_pookie_user(u_id: int) -> bool:
+    d = reload_data()
+    return int(u_id) in set(map(int, d.get("pookies", []))) or is_admin_user(u_id)
+
+
+def is_blacklisted(u_id: int) -> bool:
+    d = reload_data()
+    return int(u_id) in set(map(int, d.get("blacklist", [])))
+
 
 def sanitize_no_mentions(text: str) -> str:
+    # inserts zero-width space after @ to avoid pings
     return text.replace("@", "@\u200b")
 
-def add_file_log(kind: str, message: str):
+
+def exact_word_present(text: str, word: str) -> bool:
+    pattern = r"\b" + re.escape(word) + r"\b"
+    return re.search(pattern, text, flags=re.IGNORECASE) is not None
+
+
+def log_to_file(kind: str, message: str):
     d = reload_data()
     entry = {"ts": datetime.now(timezone.utc).isoformat(), "kind": kind, "message": message}
     d.setdefault("logs", [])
@@ -169,34 +165,30 @@ def add_file_log(kind: str, message: str):
         d["logs"] = d["logs"][-LOGS_KEEP:]
     save_data(d)
 
-async def send_log_embed(guild: Optional[discord.Guild], title: str, description: str, color=discord.Color.blurple(), fields: Optional[List[tuple]] = None):
+
+async def send_log_embed(guild: Optional[discord.Guild], title: str, description: str):
     d = reload_data()
     ch_id = d.get("log_channel")
     if not ch_id:
         return
     ch = bot.get_channel(ch_id)
-    if not ch:
-        # maybe in guild
-        if guild:
-            ch = guild.get_channel(ch_id) if hasattr(guild, "get_channel") else None
-    if not ch:
-        return
-    emb = discord.Embed(title=title, description=description, color=color, timestamp=datetime.now(timezone.utc))
-    if fields:
-        for n, v, i in fields:
-            emb.add_field(name=n, value=v, inline=i)
-    try:
-        await ch.send(embed=emb)
-    except Exception:
-        pass
+    if not ch and guild:
+        ch = guild.get_channel(ch_id) if hasattr(guild, "get_channel") else None
+    if ch:
+        embed = discord.Embed(title=title, description=description, color=discord.Color.orange(),
+                              timestamp=datetime.now(timezone.utc))
+        try:
+            await ch.send(embed=embed)
+        except Exception:
+            pass
 
-def exact_word_present(text: str, word: str) -> bool:
-    pattern = r"\b" + re.escape(word) + r"\b"
-    return re.search(pattern, text, flags=re.IGNORECASE) is not None
 
-# ------------------------- SNIPES -------------------------
+# -------------------------
+# SNIPE STORAGE + VIEW
+# -------------------------
 SNIPES: Dict[int, List[Dict[str, Any]]] = {}
 ESNIPES: Dict[int, List[Dict[str, Any]]] = {}
+
 
 def push_snipe(store: Dict[int, List[Dict[str, Any]]], channel_id: int, entry: Dict[str, Any]):
     lst = store.setdefault(channel_id, [])
@@ -204,75 +196,101 @@ def push_snipe(store: Dict[int, List[Dict[str, Any]]], channel_id: int, entry: D
     if len(lst) > SNIPES_KEEP:
         del lst[0]
 
+
 class SnipeView(discord.ui.View):
     def __init__(self, items: List[Dict[str, Any]]):
-        super().__init__(timeout=60)
+        super().__init__(timeout=120)
         self.items = items
-        self.idx = len(items) - 1
+        self.index = len(items) - 1
 
-    def make_embed(self):
-        data = self.items[self.idx]
-        emb = discord.Embed(title=f"Snipe [{self.idx+1}/{len(self.items)}]", color=discord.Color.blurple())
+    def make_embed(self) -> discord.Embed:
+        data = self.items[self.index]
+        emb = discord.Embed(color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
+        emb.set_author(name=data.get("author_tag", "Unknown"), icon_url=data.get("avatar_url") or discord.Embed.Empty)
+        emb.set_footer(text=f"{self.index + 1}/{len(self.items)} • {data.get('time','')}")
         if "content" in data:
-            emb.add_field(name="Content", value=data.get("content", "*empty*")[:1024], inline=False)
+            emb.add_field(name="Message", value=data.get("content") or "*empty*", inline=False)
         else:
-            emb.add_field(name="Before", value=data.get("before","")[:1024] or "*empty*", inline=False)
-            emb.add_field(name="After", value=data.get("after","")[:1024] or "*empty*", inline=False)
-        emb.set_author(name=data.get("author_tag","Unknown"), icon_url=data.get("avatar_url",""))
-        emb.set_footer(text=f"{data.get('time','')}")
+            emb.add_field(name="Before", value=data.get("before") or "*empty*", inline=False)
+            emb.add_field(name="After", value=data.get("after") or "*empty*", inline=False)
         return emb
 
     @discord.ui.button(label="⬅️", style=discord.ButtonStyle.secondary)
-    async def prev(self, inter: discord.Interaction, btn: discord.ui.Button):
-        if self.idx > 0:
-            self.idx -= 1
-        await inter.response.edit_message(embed=self.make_embed(), view=self)
+    async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.index > 0:
+            self.index -= 1
+            await interaction.response.edit_message(embed=self.make_embed(), view=self)
+        else:
+            await interaction.response.defer()
 
     @discord.ui.button(label="➡️", style=discord.ButtonStyle.secondary)
-    async def nxt(self, inter: discord.Interaction, btn: discord.ui.Button):
-        if self.idx < len(self.items)-1:
-            self.idx += 1
-        await inter.response.edit_message(embed=self.make_embed(), view=self)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.index < len(self.items) - 1:
+            self.index += 1
+            await interaction.response.edit_message(embed=self.make_embed(), view=self)
+        else:
+            await interaction.response.defer()
 
-# ------------------------- CAT FETCH -------------------------
-async def fetch_random_cat(session: aiohttp.ClientSession) -> Optional[str]:
+
+# -------------------------
+# CAT FETCHER
+# -------------------------
+async def fetch_random_cat_url(session: aiohttp.ClientSession) -> Optional[str]:
     headers = {}
     if CAT_API_KEY:
         headers["x-api-key"] = CAT_API_KEY
     try:
-        async with session.get("https://api.thecatapi.com/v1/images/search", headers=headers, timeout=20) as r:
-            if r.status == 200:
-                js = await r.json()
-                if isinstance(js, list) and js:
-                    return js[0].get("url")
+        async with session.get("https://api.thecatapi.com/v1/images/search", headers=headers, timeout=20) as resp:
+            if resp.status == 200:
+                j = await resp.json()
+                if isinstance(j, list) and j:
+                    return j[0].get("url")
     except Exception:
         return None
-    # fallback
     return "https://cataas.com/cat"
 
-# ------------------------- EVENTS & LOGGING -------------------------
+
+# -------------------------
+# BOT SETUP
+# -------------------------
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix=commands.when_mentioned_or("?"), intents=intents, help_command=None)
+tree = bot.tree
+
+# start time for uptime
+BOT_START = datetime.now(timezone.utc)
+
+# in-memory last-run trackers to avoid double-sending
+_last_daily_date: Optional[str] = None
+_last_hourly_minute: Optional[str] = None
+
+
 @bot.event
 async def on_ready():
-    # sync commands once
+    # sync slash commands
     try:
         await tree.sync()
     except Exception as e:
         print("Slash sync error:", e)
-    # presence
-    await bot.change_presence(status=discord.Status.dnd, activity=discord.Streaming(name="Max Verstappen", url="https://twitch.tv/max"))
-    # start scheduled tasks now that loop is running
+    # set presence
+    await bot.change_presence(status=discord.Status.dnd,
+                              activity=discord.Streaming(name="Max Verstappen", url="https://twitch.tv/max"))
+    # start minute scheduler safely
     if not minute_scheduler.is_running():
         minute_scheduler.start()
-    print(f"Ready: {bot.user} | Guilds: {len(bot.guilds)}")
-    add_file_log("system", f"Bot ready: {bot.user} | guilds={len(bot.guilds)}")
+    print(f"✅ Logged in as {bot.user} (id: {bot.user.id}). Guilds: {len(bot.guilds)}")
+    log_to_file("system", f"Bot ready: {bot.user} in {len(bot.guilds)} guilds")
+
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Clear AFK if author was AFK
+    # reload data
     d = reload_data()
+
+    # Clear AFK if the author was AFK
     if str(message.author.id) in d.get("afk", {}):
         d["afk"].pop(str(message.author.id), None)
         save_data(d)
@@ -281,36 +299,39 @@ async def on_message(message: discord.Message):
         except Exception:
             pass
 
-    # If mentions include AFK users notify
+    # Notify if mentions include AFK users
     if message.mentions:
         for u in message.mentions:
-            info = d.get("afk", {}).get(str(u.id))
-            if info:
-                reason = info.get("reason", "AFK")
-                since = info.get("since")
+            afk = d.get("afk", {}).get(str(u.id))
+            if afk:
+                reason = afk.get("reason", "AFK")
+                since = afk.get("since")
                 try:
                     ts = int(datetime.fromisoformat(since).timestamp())
-                    await message.reply(f"{u.mention} is AFK: **{sanitize_no_mentions(reason)}** (since <t:{ts}:R>)", mention_author=False)
+                    await message.reply(f"{u.mention} is AFK — **{sanitize_no_mentions(reason)}** (since <t:{ts}:R>)",
+                                        mention_author=False)
                 except Exception:
-                    await message.reply(f"{u.mention} is AFK: **{sanitize_no_mentions(reason)}**", mention_author=False)
+                    await message.reply(f"{u.mention} is AFK — **{sanitize_no_mentions(reason)}**", mention_author=False)
 
-    # Blocked words (bypass protection: compact characters)
-    content_compact = re.sub(r"[\s\-\_\.]", "", message.content.lower())
+    # Blocked words (compact bypass protection)
+    content_compact = re.sub(r"[\s_\-\.]", "", message.content.lower())
     for w in d.get("blocked_words", []):
-        wc = re.sub(r"[\s\-\_\.]", "", w.lower())
+        wc = re.sub(r"[\s_\-\.]", "", w.lower())
         if wc and wc in content_compact:
             try:
                 await message.delete()
             except Exception:
                 pass
-            await send_log_embed(message.guild, "Blocked Word", f"{message.author.mention} used blocked word `{w}` in {message.channel.mention}")
-            add_file_log("blocked_word", f"{message.author} used blocked word {w} in {message.channel}")
+            await send_log_embed(message.guild, "Blocked Word",
+                                 f"{message.author.mention} used blocked word `{w}` in {message.channel.mention}")
+            log_to_file("blocked_word", f"{message.author} used blocked word {w} in {message.channel}")
             return
 
-    # Triggers (exact whole word)
+    # Triggers (exact-word)
     for word, reply in d.get("triggers", {}).items():
         if exact_word_present(message.content, word):
             out = reply.replace("{user}", message.author.mention)
+            out = sanitize_no_mentions(out) if not is_admin_user(message.author.id) else out
             try:
                 await message.channel.send(out)
             except Exception:
@@ -319,19 +340,21 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
+
 @bot.event
 async def on_message_delete(message: discord.Message):
-    if message.author and message.author.bot:
+    if not message.author or message.author.bot:
         return
     push_snipe(SNIPES, message.channel.id, {
-        "author_id": message.author.id if message.author else None,
-        "author_tag": str(message.author) if message.author else "Unknown",
+        "author_tag": str(message.author),
         "avatar_url": getattr(message.author.display_avatar, "url", ""),
         "content": message.content or "",
         "time": datetime.now(timezone.utc).isoformat()
     })
-    await send_log_embed(message.guild, "Message Deleted", f"**{message.author}** deleted a message in {message.channel.mention}\n```{sanitize_no_mentions(message.content)[:1000]}```", discord.Color.red())
-    add_file_log("delete", f"{message.author} deleted message in {message.channel}: {message.content[:200]}")
+    await send_log_embed(message.guild, "Message Deleted",
+                         f"{message.author.mention} deleted a message in {message.channel.mention}\n```{sanitize_no_mentions(message.content)[:900]}```")
+    log_to_file("delete", f"{message.author} deleted message in {message.channel}")
+
 
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
@@ -340,108 +363,394 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     if before.content == after.content:
         return
     push_snipe(ESNIPES, before.channel.id, {
-        "author_id": before.author.id if before.author else None,
-        "author_tag": str(before.author) if before.author else "Unknown",
+        "author_tag": str(before.author),
         "avatar_url": getattr(before.author.display_avatar, "url", ""),
         "before": before.content,
         "after": after.content,
         "time": datetime.now(timezone.utc).isoformat()
     })
-    await send_log_embed(before.guild, "Message Edited", f"**{before.author}** edited a message in {before.channel.mention}\n**Before:**\n```{sanitize_no_mentions(before.content)[:800]}```\n**After:**\n```{sanitize_no_mentions(after.content)[:800]}```", discord.Color.orange())
-    add_file_log("edit", f"{before.author} edited message in {before.channel}")
+    await send_log_embed(before.guild, "Message Edited",
+                         f"{before.author.mention} edited a message in {before.channel.mention}\n**Before:**\n```{sanitize_no_mentions(before.content)[:800]}```\n**After:**\n```{sanitize_no_mentions(after.content)[:800]}```")
+    log_to_file("edit", f"{before.author} edited message in {before.channel}")
 
-# ------------------------- SNIPE COMMANDS -------------------------
-@tree.command(name="snipe", description="Show the most recent deleted messages (this channel).")
-async def slash_snipe(inter: discord.Interaction):
-    items = SNIPES.get(inter.channel_id, [])
+
+# -------------------------
+# SNIPE SLASH COMMANDS
+# -------------------------
+@tree.command(name="snipe", description="Show recent deleted messages in this channel")
+async def slash_snipe(interaction: discord.Interaction):
+    items = SNIPES.get(interaction.channel_id, [])
     if not items:
-        return await inter.response.send_message("Nothing to snipe here.", ephemeral=True)
+        return await interaction.response.send_message("Nothing to snipe here.", ephemeral=True)
     view = SnipeView(items)
-    await inter.response.send_message(embed=view.make_embed(), view=view)
+    await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
 
-@tree.command(name="esnipe", description="Show the most recent edited messages (this channel).")
-async def slash_esnipe(inter: discord.Interaction):
-    items = ESNIPES.get(inter.channel_id, [])
+
+@tree.command(name="esnipe", description="Show recent edited messages in this channel")
+async def slash_esnipe(interaction: discord.Interaction):
+    items = ESNIPES.get(interaction.channel_id, [])
     if not items:
-        return await inter.response.send_message("No edits to snipe here.", ephemeral=True)
+        return await interaction.response.send_message("Nothing to esnipe here.", ephemeral=True)
     view = SnipeView(items)
-    await inter.response.send_message(embed=view.make_embed(), view=view)
+    await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
 
-# ------------------------- SCHEDULED TASKS -------------------------
+
+# -------------------------
+# MINUTE SCHEDULER (daily/hourly cats)
+# -------------------------
 @tasks.loop(minutes=1)
 async def minute_scheduler():
-    # runs every minute; handle daily 11:00 IST and hourly cat
-    now = datetime.now(BOT_TZ)
+    global _last_daily_date, _last_hourly_minute
+    now_local = datetime.now(BOT_TZ)
     d = reload_data()
-    # Daily at 11:00 IST
+    # Daily at 11:00 local tz
     if d.get("cat_channel"):
-        try:
-            if now.hour == 11 and now.minute == 0:
+        if now_local.hour == 11 and now_local.minute == 0:
+            today_key = now_local.date().isoformat()
+            if _last_daily_date != today_key:
                 ch = bot.get_channel(d["cat_channel"])
                 if ch:
-                    async with aiohttp.ClientSession() as s:
-                        url = await fetch_random_cat(s)
-                    if url:
-                        await ch.send(url)
-                    await asyncio.sleep(60)
-        except Exception:
-            pass
+                    try:
+                        async with aiohttp.ClientSession() as s:
+                            url = await fetch_random_cat_url(s)
+                        if url:
+                            await ch.send(url)
+                            log_to_file("cat_daily", f"Sent daily cat to {ch.id}")
+                            await send_log_embed(ch.guild, "Daily Cat", f"Sent daily cat in {ch.mention}")
+                    except Exception:
+                        pass
+                _last_daily_date = today_key
+                await asyncio.sleep(5)
     # Hourly at minute 0
     if d.get("hourly_cat_channel"):
-        try:
-            if now.minute == 0:
+        if now_local.minute == 0:
+            minute_key = f"{now_local.hour}-{now_local.minute}-{now_local.date().isoformat()}"
+            if _last_hourly_minute != minute_key:
                 ch2 = bot.get_channel(d["hourly_cat_channel"])
                 if ch2:
-                    async with aiohttp.ClientSession() as s:
-                        url = await fetch_random_cat(s)
-                    if url:
-                        await ch2.send(url)
-                    await asyncio.sleep(60)
+                    try:
+                        async with aiohttp.ClientSession() as s:
+                            url2 = await fetch_random_cat_url(s)
+                        if url2:
+                            await ch2.send(url2)
+                            log_to_file("cat_hourly", f"Sent hourly cat to {ch2.id}")
+                            await send_log_embed(ch2.guild, "Hourly Cat", f"Sent hourly cat in {ch2.mention}")
+                    except Exception:
+                        pass
+                _last_hourly_minute = minute_key
+                await asyncio.sleep(5)
+
+
+# -------------------------
+# RENDER RESTART (API)
+# -------------------------
+async def trigger_render_deploy(api_key: str, service_id: str) -> Dict[str, Any]:
+    """
+    Trigger a Render deploy: POST https://api.render.com/v1/services/{serviceId}/deploys
+    Requires: Authorization: Bearer <api_key>
+    See Render API docs for details.  [oai_citation:2‡Render API](https://api-docs.render.com/reference/create-deploy?utm_source=chatgpt.com) [oai_citation:3‡Render](https://render.com/docs/api?utm_source=chatgpt.com)
+    """
+    url = f"https://api.render.com/v1/services/{service_id}/deploys"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+    async with aiohttp.ClientSession() as s:
+        try:
+            async with s.post(url, headers=headers, json={}, timeout=20) as resp:
+                text = await resp.text()
+                try:
+                    js = await resp.json()
+                except Exception:
+                    js = {"status": resp.status, "text": text}
+                return {"status": resp.status, "body": js}
+        except Exception as e:
+            return {"status": 0, "error": str(e)}
+
+
+# -------------------------
+# CORE SLASH & PREFIX COMMANDS
+# -------------------------
+
+# UPTIME
+@tree.command(name="uptime", description="Show how long the bot has been online")
+async def slash_uptime(interaction: discord.Interaction):
+    delta = datetime.now(timezone.utc) - BOT_START
+    days = delta.days
+    hours, rem = divmod(delta.seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    await interaction.response.send_message(f"⏱ Uptime: {days}d {hours}h {minutes}m {seconds}s", ephemeral=True)
+
+
+@bot.command(name="uptime")
+async def prefix_uptime(ctx: commands.Context):
+    delta = datetime.now(timezone.utc) - BOT_START
+    days = delta.days
+    hours, rem = divmod(delta.seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    await ctx.reply(f"⏱ Uptime: {days}d {hours}h {minutes}m {seconds}s", mention_author=False)
+
+
+# SERVERS
+@tree.command(name="servers", description="List servers the bot is in (admins only)")
+async def slash_servers(interaction: discord.Interaction):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    lines = []
+    for g in bot.guilds:
+        lines.append(f"• {g.name} — id:{g.id} members:{g.member_count}")
+    text = "\n".join(lines) or "No servers."
+    await interaction.response.send_message(f"🤖 Bot in {len(bot.guilds)} servers:\n{text}", ephemeral=True)
+
+
+@bot.command(name="servers")
+async def prefix_servers(ctx: commands.Context):
+    if not is_admin_user(ctx.author.id):
+        return await ctx.reply("❌ Admins only.", mention_author=False)
+    lines = [f"• {g.name} — id:{g.id} members:{g.member_count}" for g in bot.guilds]
+    await ctx.reply(f"🤖 Bot in {len(bot.guilds)} servers:\n" + ("\n".join(lines)[:1900]), mention_author=False)
+
+
+# ASK (pings owner in log channel if set, also DMs owner)
+@tree.command(name="ask", description="Ask the owner / request a command (pings owner in log channel + DM)")
+async def slash_ask(interaction: discord.Interaction, *, request: str):
+    owner = None
+    try:
+        owner = await bot.fetch_user(OWNER_ID)
+    except Exception:
+        owner = None
+    # DM owner
+    if owner:
+        try:
+            await owner.send(f"📨 **Ask request** from {interaction.user} ({interaction.user.id}) in {interaction.guild.name if interaction.guild else 'DM'}:\n```{request[:1800]}```")
         except Exception:
             pass
+    # Ping in log channel (if set)
+    d = reload_data()
+    log_ch = d.get("log_channel")
+    if log_ch:
+        ch = bot.get_channel(int(log_ch))
+        if ch:
+            try:
+                await ch.send(f"<@{OWNER_ID}> 📨 **Request** from {interaction.user.mention} in {interaction.guild.name if interaction.guild else 'DM'}:\n```{request[:1600]}```")
+            except Exception:
+                pass
+    await interaction.response.send_message("✅ Your request was sent to the owner (and pinged in the log channel if configured).", ephemeral=True)
+    log_to_file("ask", f"{interaction.user} asked: {request[:200]}")
+    await send_log_embed(interaction.guild, "AskRequest", f"{interaction.user.mention} asked: {request[:900]}")
 
-# ------------------------- COMMAND HELPERS / CHECKS -------------------------
-def owner_or_admin_check():
-    async def predicate(inter: discord.Interaction):
-        if is_admin_user(inter.user) or is_owner(inter.user):
-            return True
-        await inter.response.send_message("Admins only.", ephemeral=True)
-        return False
-    return app_commands.check(predicate)
 
-def admin_or_pookie_check():
-    async def predicate(inter: discord.Interaction):
-        if is_pookie_user(inter.user) or is_admin_user(inter.user) or is_owner(inter.user):
-            return True
-        await inter.response.send_message("Admins or Pookie only.", ephemeral=True)
-        return False
-    return app_commands.check(predicate)
-
-def blacklist_check():
-    async def predicate(inter: discord.Interaction):
-        if is_blacklisted_user(inter.user):
-            await inter.response.send_message("You are blacklisted.", ephemeral=True)
-            return False
-        return True
-    return app_commands.check(predicate)
-
-# ------------------------- MODERATION COMMANDS -------------------------
-@tree.command(name="ban", description="Ban a member (must be in server).")
-@admin_or_pookie_check()
-@app_commands.describe(member="Member to ban", reason="Reason")
-async def slash_ban(inter: discord.Interaction, member: discord.Member, reason: Optional[str] = None):
+@bot.command(name="ask")
+async def prefix_ask(ctx: commands.Context, *, request: str):
+    owner = None
     try:
-        await member.ban(reason=reason or "No reason provided", delete_message_days=0)
-        await inter.response.send_message(f"Banned {member.mention}.")
-        await send_log_embed(inter.guild, "Ban", f"{inter.user.mention} banned {member.mention}\nReason: {sanitize_no_mentions(reason or 'No reason')}", discord.Color.red())
-        add_file_log("mod", f"{inter.user} banned {member}")
+        owner = await bot.fetch_user(OWNER_ID)
+    except Exception:
+        owner = None
+    if owner:
+        try:
+            await owner.send(f"📨 **Ask request** from {ctx.author} ({ctx.author.id}) in {ctx.guild.name if ctx.guild else 'DM'}:\n```{request[:1800]}```")
+        except Exception:
+            pass
+    d = reload_data()
+    log_ch = d.get("log_channel")
+    if log_ch:
+        ch = bot.get_channel(int(log_ch))
+        if ch:
+            try:
+                await ch.send(f"<@{OWNER_ID}> 📨 **Request** from {ctx.author.mention} in {ctx.guild.name if ctx.guild else 'DM'}:\n```{request[:1600]}```")
+            except Exception:
+                pass
+    await ctx.reply("✅ Your request was sent to the owner (and pinged in the log channel if configured).", mention_author=False)
+    log_to_file("ask", f"{ctx.author} asked: {request[:200]}")
+    await send_log_embed(ctx.guild if ctx.guild else None, "AskRequest", f"{ctx.author} asked: {request[:900]}")
+
+
+# RESTART: uses Render API if available, otherwise os._exit(0)
+@tree.command(name="restart", description="Restart the bot / trigger Render deploy (owner/admin)")
+async def slash_restart(interaction: discord.Interaction):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    if RENDER_API_KEY and RENDER_SERVICE_ID:
+        await interaction.response.send_message("🔁 Triggering Render deploy...", ephemeral=True)
+        result = await trigger_render_deploy(RENDER_API_KEY, RENDER_SERVICE_ID)
+        if result.get("status") in (200, 201):
+            await interaction.followup.send(f"✅ Render deploy triggered. Response: {result.get('body')}", ephemeral=True)
+            log_to_file("admin", f"{interaction.user} triggered render deploy")
+        else:
+            await interaction.followup.send(f"⚠️ Deploy trigger failed: {result}", ephemeral=True)
+    else:
+        # fallback: exit process, Render will restart the service
+        await interaction.response.send_message("🔁 Restarting process (no Render API configured)...", ephemeral=True)
+        log_to_file("admin", f"{interaction.user} requested restart (process exit)")
+        # graceful stop
+        asyncio.create_task(_shutdown_and_exit())
+
+@bot.command(name="restart")
+async def prefix_restart(ctx: commands.Context):
+    if not is_admin_user(ctx.author.id):
+        return await ctx.reply("❌ Admins only.", mention_author=False)
+    if RENDER_API_KEY and RENDER_SERVICE_ID:
+        await ctx.reply("🔁 Triggering Render deploy...", mention_author=False)
+        result = await trigger_render_deploy(RENDER_API_KEY, RENDER_SERVICE_ID)
+        if result.get("status") in (200, 201):
+            await ctx.reply("✅ Render deploy triggered.", mention_author=False)
+            log_to_file("admin", f"{ctx.author} triggered render deploy")
+        else:
+            await ctx.reply(f"⚠️ Deploy trigger failed: {result}", mention_author=False)
+    else:
+        await ctx.reply("🔁 Restarting process (no Render API configured)...", mention_author=False)
+        log_to_file("admin", f"{ctx.author} requested restart (process exit)")
+        asyncio.create_task(_shutdown_and_exit())
+
+
+async def _shutdown_and_exit(delay: float = 0.5):
+    # give time for response to be sent
+    await asyncio.sleep(delay)
+    try:
+        await bot.close()
+    finally:
+        os._exit(0)
+
+
+# REFRESH / SYNC
+@tree.command(name="refresh", description="Refresh slash commands (admin/owner)")
+async def slash_refresh(interaction: discord.Interaction):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    try:
+        await tree.sync()
+        await interaction.response.send_message("✅ Slash commands refreshed.", ephemeral=True)
+        log_to_file("admin", f"{interaction.user} refreshed slash commands")
     except Exception as e:
-        await inter.response.send_message(f"Failed to ban: {e}", ephemeral=True)
+        await interaction.response.send_message(f"⚠️ Failed: {e}", ephemeral=True)
+
+
+# LOG CHANNEL
+@tree.command(name="set_log_channel", description="Set the channel to receive logs")
+async def slash_set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    d = reload_data()
+    d["log_channel"] = int(channel.id)
+    save_data(d)
+    await interaction.response.send_message(f"✅ Log channel set to {channel.mention}", ephemeral=True)
+    await send_log_embed(interaction.guild, "Logs", f"{interaction.user.mention} set the log channel to {channel.mention}")
+
+
+@tree.command(name="disable_log_channel", description="Disable the log channel")
+async def slash_disable_log_channel(interaction: discord.Interaction):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    d = reload_data()
+    d["log_channel"] = None
+    save_data(d)
+    await interaction.response.send_message("✅ Log channel disabled.", ephemeral=True)
+
+
+@tree.command(name="logs", description="Show recent logs (admin)")
+async def slash_logs(interaction: discord.Interaction, count: Optional[int] = 10):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    d = reload_data()
+    logs = d.get("logs", [])[-min(max(1, count or 10), 50):]
+    text = "\n".join(f"`{l['ts']}` {l['kind']}: {l['message']}" for l in logs) or "No logs."
+    await interaction.response.send_message(text[:1900], ephemeral=True)
+
+
+# CAT CHANNELS & CAT COMMANDS
+@tree.command(name="setcatchannel", description="Set daily 11:00 cat channel (admin)")
+async def slash_set_cat_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    d = reload_data()
+    d["cat_channel"] = int(channel.id)
+    save_data(d)
+    await interaction.response.send_message(f"✅ Daily cat channel set to {channel.mention} (11:00 {BOT_TZ})", ephemeral=True)
+
+
+@tree.command(name="sethourlycatchannel", description="Set hourly cat channel (admin)")
+async def slash_set_hourly_cat_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    d = reload_data()
+    d["hourly_cat_channel"] = int(channel.id)
+    save_data(d)
+    await interaction.response.send_message(f"✅ Hourly cat channel set to {channel.mention}", ephemeral=True)
+
+
+@tree.command(name="cat", description="Get a random cat image")
+async def slash_cat(interaction: discord.Interaction):
+    await interaction.response.defer()
+    async with aiohttp.ClientSession() as s:
+        url = await fetch_random_cat_url(s)
+    if not url:
+        return await interaction.followup.send("⚠️ Couldn't fetch a cat right now.")
+    await interaction.followup.send(url)
+
+
+@bot.command(name="cat")
+async def prefix_cat(ctx: commands.Context):
+    if is_blacklisted(ctx.author.id):
+        return await ctx.reply("You are blacklisted.", mention_author=False)
+    async with aiohttp.ClientSession() as s:
+        url = await fetch_random_cat_url(s)
+    await ctx.send(url)
+    log_to_file("cat", f"{ctx.author} requested cat")
+
+
+# SAY / SAY_ADMIN
+@tree.command(name="say", description="Bot repeats text (no pings)")
+async def slash_say(interaction: discord.Interaction, *, text: str):
+    safe = sanitize_no_mentions(text)
+    await interaction.response.send_message("✅ Sent (no pings).", ephemeral=True)
+    await interaction.channel.send(safe, allowed_mentions=discord.AllowedMentions.none())
+    log_to_file("command", f"{interaction.user} used /say")
+
+
+@tree.command(name="say_admin", description="Admin say (pings allowed)")
+async def slash_say_admin(interaction: discord.Interaction, *, text: str):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    await interaction.response.send_message("✅ Sent.", ephemeral=True)
+    await interaction.channel.send(text)
+    log_to_file("command", f"{interaction.user} used /say_admin")
+
+
+@bot.command(name="say")
+async def prefix_say(ctx: commands.Context, *, text: str):
+    safe = sanitize_no_mentions(text)
+    await ctx.send(safe, allowed_mentions=discord.AllowedMentions.none())
+    log_to_file("command", f"{ctx.author} used ?say")
+
+
+@bot.command(name="say_admin")
+async def prefix_say_admin(ctx: commands.Context, *, text: str):
+    if not is_admin_user(ctx.author.id):
+        return await ctx.reply("Admins only.", mention_author=False)
+    await ctx.send(text)
+    log_to_file("command", f"{ctx.author} used ?say_admin")
+
+
+# BAN / KICK (slash requires member object; prefix supports ID or mention)
+@tree.command(name="ban", description="Ban a guild member (admin)")
+async def slash_ban(interaction: discord.Interaction, member: discord.Member, *, reason: Optional[str] = "No reason provided"):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    try:
+        await member.ban(reason=reason)
+        await interaction.response.send_message(f"🔨 {member.mention} banned. Reason: {sanitize_no_mentions(reason)}")
+        await send_log_embed(interaction.guild, "Ban", f"{interaction.user.mention} banned {member.mention} — {sanitize_no_mentions(reason)}")
+        log_to_file("mod", f"{interaction.user} banned {member} — {reason}")
+    except Exception as e:
+        await interaction.response.send_message(f"Failed: {e}", ephemeral=True)
+
 
 @bot.command(name="ban")
-async def prefix_ban(ctx: commands.Context, target: str, *, reason: str = ""):
-    if not is_pookie_user(ctx.author) and not is_admin_user(ctx.author) and not is_owner(ctx.author):
-        return await ctx.reply("Admins or Pookie only.", mention_author=False)
+async def prefix_ban(ctx: commands.Context, target: str, *, reason: Optional[str] = "No reason provided"):
+    if not is_admin_user(ctx.author.id):
+        return await ctx.reply("Admins only.", mention_author=False)
     uid = None
     m = re.match(r"<@!?(\d+)>", target)
     if m:
@@ -450,628 +759,435 @@ async def prefix_ban(ctx: commands.Context, target: str, *, reason: str = ""):
         try:
             uid = int(target)
         except Exception:
-            return await ctx.reply("Provide mention or ID.", mention_author=False)
+            return await ctx.reply("Provide user mention or ID.", mention_author=False)
     member = ctx.guild.get_member(uid)
-    if member:
-        try:
-            await member.ban(reason=reason or "No reason", delete_message_days=0)
-            await ctx.reply(f"Banned {member.mention}.", mention_author=False)
-            await send_log_embed(ctx.guild, "Ban", f"{ctx.author.mention} banned {member.mention}\nReason: {sanitize_no_mentions(reason or 'No reason')}", discord.Color.red())
-            add_file_log("mod", f"{ctx.author} banned {member}")
-        except Exception as e:
-            await ctx.reply(f"Failed to ban: {e}", mention_author=False)
-    else:
-        # ban by ID
-        try:
-            await ctx.guild.ban(discord.Object(id=uid), reason=reason or "No reason", delete_message_days=0)
-            await ctx.reply(f"Banned <@{uid}> (by ID).", mention_author=False)
-            await send_log_embed(ctx.guild, "Ban (ID)", f"{ctx.author.mention} banned <@{uid}> by ID", discord.Color.red())
-            add_file_log("mod", f"{ctx.author} banned id {uid}")
-        except Exception as e:
-            await ctx.reply(f"Failed to ban by ID: {e}", mention_author=False)
-
-@tree.command(name="kick", description="Kick a member.")
-@admin_or_pookie_check()
-@app_commands.describe(member="Member to kick", reason="Reason")
-async def slash_kick(inter: discord.Interaction, member: discord.Member, reason: Optional[str] = None):
     try:
-        await member.kick(reason=reason or "No reason")
-        await inter.response.send_message(f"Kicked {member.mention}.")
-        await send_log_embed(inter.guild, "Kick", f"{inter.user.mention} kicked {member.mention}\nReason: {sanitize_no_mentions(reason or 'No reason')}", discord.Color.orange())
-        add_file_log("mod", f"{inter.user} kicked {member}")
-    except Exception as e:
-        await inter.response.send_message(f"Failed to kick: {e}", ephemeral=True)
-
-@bot.command(name="kick")
-async def prefix_kick(ctx: commands.Context, target: str, *, reason: str = ""):
-    if not is_pookie_user(ctx.author) and not is_admin_user(ctx.author) and not is_owner(ctx.author):
-        return await ctx.reply("Admins or Pookie only.", mention_author=False)
-    member = None
-    m = re.match(r"<@!?(\d+)>", target)
-    if m:
-        member = ctx.guild.get_member(int(m.group(1)))
-    else:
-        if target.isdigit():
-            member = ctx.guild.get_member(int(target))
-    if not member:
-        return await ctx.reply("Member not found in server.", mention_author=False)
-    try:
-        await member.kick(reason=reason or "No reason")
-        await ctx.reply(f"Kicked {member.mention}.", mention_author=False)
-        await send_log_embed(ctx.guild, "Kick", f"{ctx.author.mention} kicked {member.mention}\nReason: {sanitize_no_mentions(reason or 'No reason')}", discord.Color.orange())
-        add_file_log("mod", f"{ctx.author} kicked {member}")
-    except Exception as e:
-        await ctx.reply(f"Failed to kick: {e}", mention_author=False)
-
-# Purge
-@tree.command(name="purge", description="Delete up to 100 messages (admin/pookie).")
-@admin_or_pookie_check()
-@app_commands.describe(amount="How many messages to delete (1-100)")
-async def slash_purge(inter: discord.Interaction, amount: app_commands.Range[int, 1, 100]):
-    try:
-        deleted = await inter.channel.purge(limit=amount)
-        await inter.response.send_message(f"Deleted {len(deleted)} messages.", ephemeral=True)
-        await send_log_embed(inter.guild, "Purge", f"{inter.user.mention} purged {len(deleted)} messages in {inter.channel.mention}")
-        add_file_log("mod", f"{inter.user} purged {len(deleted)} messages in {inter.channel}")
-    except Exception as e:
-        await inter.response.send_message(f"Failed: {e}", ephemeral=True)
-
-@bot.command(name="purge")
-async def prefix_purge(ctx: commands.Context, amount: int):
-    if not is_pookie_user(ctx.author):
-        return await ctx.reply("Admins or Pookie only.", mention_author=False)
-    amount = max(1, min(100, amount))
-    try:
-        deleted = await ctx.channel.purge(limit=amount)
-        m = await ctx.send(f"Deleted {len(deleted)} messages.")
-        await asyncio.sleep(3)
-        await m.delete()
-        await send_log_embed(ctx.guild, "Purge", f"{ctx.author.mention} purged {len(deleted)} messages in {ctx.channel.mention}")
-        add_file_log("mod", f"{ctx.author} purged {len(deleted)}")
+        if member:
+            await member.ban(reason=reason)
+            await ctx.reply(f"🔨 {member.mention} banned. Reason: {sanitize_no_mentions(reason)}", mention_author=False)
+        else:
+            await ctx.guild.ban(discord.Object(id=uid), reason=reason)
+            await ctx.reply(f"🔨 Banned ID {uid}.", mention_author=False)
+        await send_log_embed(ctx.guild, "Ban", f"{ctx.author.mention} banned {target} — {sanitize_no_mentions(reason)}")
+        log_to_file("mod", f"{ctx.author} banned {target} — {reason}")
     except Exception as e:
         await ctx.reply(f"Failed: {e}", mention_author=False)
 
-# ------------------------- SAY COMMANDS -------------------------
-@tree.command(name="say", description="Bot repeats text (no pings).")
-@blacklist_check()
-@app_commands.describe(text="Text to send (pings disabled)")
-async def slash_say(inter: discord.Interaction, text: str):
-    safe = sanitize_no_mentions(text)
-    await inter.response.send_message("Sent.", ephemeral=True)
-    await inter.channel.send(safe, allowed_mentions=discord.AllowedMentions.none())
-    add_file_log("command", f"{inter.user} used /say")
 
-@bot.command(name="say")
-async def prefix_say(ctx: commands.Context, *, text: str):
-    if is_blacklisted_user(ctx.author):
-        return await ctx.reply("You are blacklisted.", mention_author=False)
-    safe = sanitize_no_mentions(text)
-    await ctx.send(safe, allowed_mentions=discord.AllowedMentions.none())
-    add_file_log("command", f"{ctx.author} used ?say")
+@tree.command(name="kick", description="Kick a guild member (admin)")
+async def slash_kick(interaction: discord.Interaction, member: discord.Member, *, reason: Optional[str] = "No reason provided"):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    try:
+        await member.kick(reason=reason)
+        await interaction.response.send_message(f"👢 {member.mention} kicked. Reason: {sanitize_no_mentions(reason)}")
+        await send_log_embed(interaction.guild, "Kick", f"{interaction.user.mention} kicked {member.mention} — {sanitize_no_mentions(reason)}")
+        log_to_file("mod", f"{interaction.user} kicked {member} — {reason}")
+    except Exception as e:
+        await interaction.response.send_message(f"Failed: {e}", ephemeral=True)
 
-@tree.command(name="say_admin", description="Admin say (pings allowed).")
-@admin_or_pookie_check()
-@app_commands.describe(text="Text to send (pings allowed)")
-async def slash_say_admin(inter: discord.Interaction, text: str):
-    await inter.response.send_message("Sent.", ephemeral=True)
-    await inter.channel.send(text)
-    add_file_log("command", f"{inter.user} used /say_admin")
 
-# ------------------------- ADMIN & POOKIE MANAGEMENT -------------------------
-@tree.command(name="add_admin", description="Add an admin (owner only).")
-@app_commands.check(lambda inter: inter.user.id == OWNER_ID)
-@app_commands.describe(user="User to make admin")
-async def slash_add_admin(inter: discord.Interaction, user: discord.User):
+@bot.command(name="kick")
+async def prefix_kick(ctx: commands.Context, target: str, *, reason: Optional[str] = "No reason provided"):
+    if not is_admin_user(ctx.author.id):
+        return await ctx.reply("Admins only.", mention_author=False)
+    m = re.match(r"<@!?(\d+)>", target)
+    uid = int(m.group(1)) if m else (int(target) if target.isdigit() else None)
+    if not uid:
+        return await ctx.reply("Provide user mention or ID.", mention_author=False)
+    member = ctx.guild.get_member(uid)
+    if not member:
+        return await ctx.reply("Member not found in this guild.", mention_author=False)
+    try:
+        await member.kick(reason=reason)
+        await ctx.reply(f"👢 {member.mention} kicked. Reason: {sanitize_no_mentions(reason)}", mention_author=False)
+        await send_log_embed(ctx.guild, "Kick", f"{ctx.author.mention} kicked {member.mention} — {sanitize_no_mentions(reason)}")
+        log_to_file("mod", f"{ctx.author} kicked {member} — {reason}")
+    except Exception as e:
+        await ctx.reply(f"Failed: {e}", mention_author=False)
+
+
+# PURGE (slash and prefix)
+@tree.command(name="purge", description="Delete up to 100 messages (admin/pookie)")
+async def slash_purge(interaction: discord.Interaction, amount: Optional[int] = 10):
+    if not (is_admin_user(interaction.user.id) or is_pookie_user(interaction.user.id)):
+        return await interaction.response.send_message("Admins/Pookie only.", ephemeral=True)
+    amount = max(1, min(100, amount or 10))
+    try:
+        deleted = await interaction.channel.purge(limit=amount)
+        await interaction.response.send_message(f"🧹 Deleted {len(deleted)} messages.", ephemeral=True)
+        log_to_file("mod", f"{interaction.user} purged {len(deleted)} messages in {interaction.channel}")
+        await send_log_embed(interaction.guild, "Purge", f"{interaction.user.mention} purged {len(deleted)} messages in {interaction.channel.mention}")
+    except Exception as e:
+        await interaction.response.send_message(f"Failed: {e}", ephemeral=True)
+
+
+@bot.command(name="purge")
+async def prefix_purge(ctx: commands.Context, amount: int = 10):
+    if not is_pookie_user(ctx.author.id) and not is_admin_user(ctx.author.id):
+        return await ctx.reply("Admins/Pookie only.", mention_author=False)
+    amount = max(1, min(100, amount))
+    try:
+        deleted = await ctx.channel.purge(limit=amount)
+        m = await ctx.send(f"🧹 Deleted {len(deleted)} messages.")
+        await asyncio.sleep(3)
+        await m.delete()
+        await send_log_embed(ctx.guild, "Purge", f"{ctx.author.mention} purged {len(deleted)} messages in {ctx.channel.mention}")
+        log_to_file("mod", f"{ctx.author} purged {len(deleted)}")
+    except Exception as e:
+        await ctx.reply(f"Failed: {e}", mention_author=False)
+
+
+# -------------------------
+# TRIGGERS (auto-responder)
+# -------------------------
+@tree.command(name="trigger_add", description="Add exact-word trigger (admin)")
+async def slash_trigger_add(interaction: discord.Interaction, word: str, *, reply: str):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
     d = reload_data()
-    if user.id not in d["admins"]:
-        d["admins"].append(int(user.id))
+    d.setdefault("triggers", {})
+    d["triggers"][word.lower()] = reply
+    save_data(d)
+    await interaction.response.send_message(f"✅ Trigger added: `{word}` → `{reply}`", ephemeral=True)
+
+
+@tree.command(name="trigger_remove", description="Remove trigger (admin)")
+async def slash_trigger_remove(interaction: discord.Interaction, word: str):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    d = reload_data()
+    if word.lower() in d.get("triggers", {}):
+        d["triggers"].pop(word.lower(), None)
         save_data(d)
-    await inter.response.send_message(f"Added {user.mention} as admin.")
+        return await interaction.response.send_message(f"✅ Removed trigger `{word}`", ephemeral=True)
+    await interaction.response.send_message("Trigger not found.", ephemeral=True)
 
-@tree.command(name="remove_admin", description="Remove an admin (owner only).")
-@app_commands.check(lambda inter: inter.user.id == OWNER_ID)
-@app_commands.describe(user="Admin user to remove")
-async def slash_remove_admin(inter: discord.Interaction, user: discord.User):
+
+@tree.command(name="showtrigger", description="Show triggers (admin)")
+async def slash_show_trigger(interaction: discord.Interaction):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
     d = reload_data()
-    if user.id == OWNER_ID:
-        return await inter.response.send_message("Cannot remove the owner.", ephemeral=True)
-    if user.id in d["admins"]:
-        d["admins"].remove(int(user.id))
-        save_data(d)
-        return await inter.response.send_message(f"Removed {user.mention} from admins.")
-    await inter.response.send_message("User not an admin.", ephemeral=True)
+    t = d.get("triggers", {})
+    if not t:
+        return await interaction.response.send_message("No triggers set.", ephemeral=True)
+    text = "\n".join(f"`{k}` → `{v[:400]}`" for k, v in t.items())
+    await interaction.response.send_message(text[:1900], ephemeral=True)
 
-@tree.command(name="show_admins", description="List admins (owner/admin only).")
-@owner_or_admin_check()
-async def slash_show_admins(inter: discord.Interaction):
-    d = reload_data()
-    mentions = [f"<@{uid}>" for uid in d.get("admins", [])]
-    await inter.response.send_message("Admins:\n" + "\n".join(mentions), ephemeral=True)
 
-@tree.command(name="addpookie", description="Add pookie user (owner/admin).")
-@owner_or_admin_check()
-@app_commands.describe(user="User to add as pookie")
-async def slash_add_pookie(inter: discord.Interaction, user: discord.User):
-    d = reload_data()
-    if user.id not in d["pookies"]:
-        d["pookies"].append(int(user.id))
-        save_data(d)
-    await inter.response.send_message(f"Added {user.mention} as pookie.")
-
-@tree.command(name="removepookie", description="Remove pookie (owner/admin).")
-@owner_or_admin_check()
-@app_commands.describe(user="User to remove from pookie")
-async def slash_remove_pookie(inter: discord.Interaction, user: discord.User):
-    d = reload_data()
-    if user.id in d["pookies"]:
-        d["pookies"].remove(int(user.id))
-        save_data(d)
-        return await inter.response.send_message(f"Removed {user.mention} from pookie.")
-    await inter.response.send_message("User not a pookie.", ephemeral=True)
-
-@tree.command(name="listpookie", description="List pookie users (owner/admin).")
-@owner_or_admin_check()
-async def slash_list_pookie(inter: discord.Interaction):
-    d = reload_data()
-    mentions = [f"<@{uid}>" for uid in d.get("pookies", [])]
-    await inter.response.send_message("Pookies:\n" + ("\n".join(mentions) if mentions else "None"), ephemeral=True)
-
-# ------------------------- BLACKLIST -------------------------
-@tree.command(name="blacklist", description="Blacklist user from using commands (owner/admin).")
-@owner_or_admin_check()
-@app_commands.describe(user="User to blacklist")
-async def slash_blacklist(inter: discord.Interaction, user: discord.User):
-    d = reload_data()
-    if int(user.id) not in d["blacklist"]:
-        d["blacklist"].append(int(user.id))
-        save_data(d)
-    await inter.response.send_message(f"Blacklisted {user.mention}")
-
-@tree.command(name="unblacklist", description="Remove user from blacklist (owner/admin).")
-@owner_or_admin_check()
-@app_commands.describe(user="User to unblacklist")
-async def slash_unblacklist(inter: discord.Interaction, user: discord.User):
-    d = reload_data()
-    if int(user.id) in d["blacklist"]:
-        d["blacklist"].remove(int(user.id))
-        save_data(d)
-        return await inter.response.send_message(f"Unblacklisted {user.mention}")
-    await inter.response.send_message("User not blacklisted.", ephemeral=True)
-
-# ------------------------- BLOCKED WORDS -------------------------
-@tree.command(name="blocked_add", description="Add a blocked word (admin).")
-@owner_or_admin_check()
-@app_commands.describe(word="Exact word to block")
-async def slash_blocked_add(inter: discord.Interaction, word: str):
+# -------------------------
+# BLOCKED WORDS
+# -------------------------
+@tree.command(name="blocked_add", description="Add blocked word (admin)")
+async def slash_blocked_add(interaction: discord.Interaction, word: str):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
     d = reload_data()
     w = word.strip().lower()
     if w and w not in d["blocked_words"]:
         d["blocked_words"].append(w)
         save_data(d)
-    await inter.response.send_message(f"Blocked word `{w}` added.")
+    await interaction.response.send_message(f"✅ Blocked word `{w}` added.", ephemeral=True)
 
-@tree.command(name="blocked_remove", description="Remove blocked word (admin).")
-@owner_or_admin_check()
-@app_commands.describe(word="Word to remove")
-async def slash_blocked_remove(inter: discord.Interaction, word: str):
+
+@tree.command(name="blocked_remove", description="Remove blocked word (admin)")
+async def slash_blocked_remove(interaction: discord.Interaction, word: str):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
     d = reload_data()
     w = word.strip().lower()
     if w in d["blocked_words"]:
         d["blocked_words"].remove(w)
         save_data(d)
-        return await inter.response.send_message(f"Blocked word `{w}` removed.")
-    await inter.response.send_message("Word not found.", ephemeral=True)
+        return await interaction.response.send_message(f"✅ Blocked word `{w}` removed.", ephemeral=True)
+    await interaction.response.send_message("Word not found.", ephemeral=True)
 
-@tree.command(name="blocked_list", description="List blocked words.")
-@owner_or_admin_check()
-async def slash_blocked_list(inter: discord.Interaction):
+
+@tree.command(name="blocked_list", description="List blocked words (admin)")
+async def slash_blocked_list(interaction: discord.Interaction):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
     d = reload_data()
     words = d.get("blocked_words", [])
     if not words:
-        return await inter.response.send_message("No blocked words.")
-    await inter.response.send_message("Blocked words:\n" + "\n".join(f"`{w}`" for w in words))
+        return await interaction.response.send_message("No blocked words.", ephemeral=True)
+    await interaction.response.send_message("\n".join(f"`{w}`" for w in words[:200]), ephemeral=True)
 
-# ------------------------- LOGGING CHANNEL & LOGS -------------------------
-@tree.command(name="set_log_channel", description="Set channel that receives logs (owner/admin).")
-@owner_or_admin_check()
-@app_commands.describe(channel="Text channel for logs")
-async def slash_set_log_channel(inter: discord.Interaction, channel: discord.TextChannel):
+
+# -------------------------
+# AFK (slash + prefix)
+# -------------------------
+@tree.command(name="afk", description="Set AFK with optional reason")
+async def slash_afk(interaction: discord.Interaction, *, reason: Optional[str] = "AFK"):
     d = reload_data()
-    d["log_channel"] = int(channel.id)
+    d.setdefault("afk", {})
+    d["afk"][str(interaction.user.id)] = {"reason": reason or "AFK", "since": datetime.now(timezone.utc).isoformat()}
     save_data(d)
-    await inter.response.send_message(f"Log channel set to {channel.mention}")
-    await send_log_embed(inter.guild, "Log channel set", f"{inter.user.mention} set logs to {channel.mention}")
+    await interaction.response.send_message(f"💤 Set AFK: **{sanitize_no_mentions(reason or 'AFK')}**", ephemeral=True)
 
-@tree.command(name="disable_log_channel", description="Disable logs.")
-@owner_or_admin_check()
-async def slash_disable_log_channel(inter: discord.Interaction):
+
+@tree.command(name="afk_clear", description="Clear your AFK")
+async def slash_afk_clear(interaction: discord.Interaction):
     d = reload_data()
-    d["log_channel"] = None
+    if str(interaction.user.id) in d.get("afk", {}):
+        d["afk"].pop(str(interaction.user.id), None)
+        save_data(d)
+        return await interaction.response.send_message("✅ AFK removed.", ephemeral=True)
+    await interaction.response.send_message("ℹ️ You were not AFK.", ephemeral=True)
+
+
+@bot.command(name="afk")
+async def prefix_afk(ctx: commands.Context, *, reason: Optional[str] = "AFK"):
+    d = reload_data()
+    d.setdefault("afk", {})
+    d["afk"][str(ctx.author.id)] = {"reason": reason or "AFK", "since": datetime.now(timezone.utc).isoformat()}
     save_data(d)
-    await inter.response.send_message("Log channel disabled.")
+    await ctx.reply(f"💤 Set AFK: **{sanitize_no_mentions(reason or 'AFK')}**", mention_author=False)
 
-@tree.command(name="logs", description="Show recent logs (owner/admin).")
-@owner_or_admin_check()
-@app_commands.describe(count="How many to show (1-50)")
-async def slash_logs(inter: discord.Interaction, count: app_commands.Range[int, 1, 50] = 10):
+
+@bot.command(name="afk_clear")
+async def prefix_afk_clear(ctx: commands.Context):
     d = reload_data()
-    logs = d.get("logs", [])
-    if not logs:
-        return await inter.response.send_message("No logs.", ephemeral=True)
-    last = logs[-count:]
-    text = "\n".join(f"`{e['ts']}` **{e['kind']}** — {e['message']}"[:1900] for e in last)
-    await inter.response.send_message(text or "Empty.", ephemeral=True)
+    if str(ctx.author.id) in d.get("afk", {}):
+        d["afk"].pop(str(ctx.author.id), None)
+        save_data(d)
+        return await ctx.reply("✅ AFK removed.", mention_author=False)
+    await ctx.reply("ℹ️ You were not AFK.", mention_author=False)
 
-# ------------------------- CAT CHANNELS -------------------------
-@tree.command(name="setcatchannel", description="Set daily 11:00 IST cat channel (owner/admin).")
-@owner_or_admin_check()
-@app_commands.describe(channel="Text channel")
-async def slash_set_cat_channel(inter: discord.Interaction, channel: discord.TextChannel):
+
+# -------------------------
+# ADMIN / POKIE MANAGEMENT
+# -------------------------
+@tree.command(name="add_admin", description="Add admin (owner only)")
+async def slash_add_admin(interaction: discord.Interaction, user: discord.User):
+    if not is_owner(interaction.user.id):
+        return await interaction.response.send_message("Only owner can add admins.", ephemeral=True)
     d = reload_data()
-    d["cat_channel"] = int(channel.id)
-    save_data(d)
-    await inter.response.send_message(f"Daily cat channel set to {channel.mention} (11:00 IST)")
-    await send_log_embed(inter.guild, "Daily cat channel set", f"{inter.user.mention} set daily cat channel to {channel.mention}")
+    if int(user.id) not in d["admins"]:
+        d["admins"].append(int(user.id))
+        save_data(d)
+    await interaction.response.send_message(f"✅ {user.mention} added as admin.", ephemeral=True)
 
-@tree.command(name="sethourlycatchannel", description="Set hourly cat channel (owner/admin).")
-@owner_or_admin_check()
-@app_commands.describe(channel="Text channel")
-async def slash_set_hourly_cat_channel(inter: discord.Interaction, channel: discord.TextChannel):
+
+@tree.command(name="remove_admin", description="Remove admin (owner only)")
+async def slash_remove_admin(interaction: discord.Interaction, user: discord.User):
+    if not is_owner(interaction.user.id):
+        return await interaction.response.send_message("Only owner can remove admins.", ephemeral=True)
     d = reload_data()
-    d["hourly_cat_channel"] = int(channel.id)
-    save_data(d)
-    await inter.response.send_message(f"Hourly cat channel set to {channel.mention}")
-    await send_log_embed(inter.guild, "Hourly cat channel set", f"{inter.user.mention} set hourly cat channel to {channel.mention}")
+    if int(user.id) == OWNER_ID:
+        return await interaction.response.send_message("Cannot remove the owner.", ephemeral=True)
+    if int(user.id) in d["admins"]:
+        d["admins"].remove(int(user.id))
+        save_data(d)
+        return await interaction.response.send_message(f"✅ {user.mention} removed from admins.", ephemeral=True)
+    await interaction.response.send_message("User not an admin.", ephemeral=True)
 
-@tree.command(name="cat", description="Get a random cat image.")
-@blacklist_check()
-async def slash_cat_cmd(inter: discord.Interaction):
-    await inter.response.defer()
-    async with aiohttp.ClientSession() as s:
-        url = await fetch_random_cat(s)
-    if not url:
-        return await inter.followup.send("Couldn't fetch a cat right now.")
-    await inter.followup.send(url)
 
-@bot.command(name="cat")
-async def prefix_cat(ctx: commands.Context):
-    if is_blacklisted_user(ctx.author):
-        return await ctx.reply("You are blacklisted.", mention_author=False)
-    async with aiohttp.ClientSession() as s:
-        url = await fetch_random_cat(s)
-    await ctx.send(url)
-    add_file_log("cat", f"{ctx.author} requested cat")
+@tree.command(name="show_admins", description="Show admins (owner/admin)")
+async def slash_show_admins(interaction: discord.Interaction):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    d = reload_data()
+    mentions = [f"<@{uid}>" for uid in d.get("admins", [])]
+    await interaction.response.send_message("Admins:\n" + ("\n".join(mentions) or "None"), ephemeral=True)
 
-# ------------------------- FUN COMMANDS -------------------------
-@tree.command(name="8ball", description="Ask the magic 8-ball.")
-@blacklist_check()
-@app_commands.describe(question="Your question")
-async def slash_8ball(inter: discord.Interaction, question: str):
+
+@tree.command(name="addpookie", description="Add pookie (owner/admin)")
+async def slash_add_pookie(interaction: discord.Interaction, user: discord.User):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    d = reload_data()
+    if int(user.id) not in d["pookies"]:
+        d["pookies"].append(int(user.id))
+        save_data(d)
+    await interaction.response.send_message(f"✅ {user.mention} added as pookie.", ephemeral=True)
+
+
+@tree.command(name="removepookie", description="Remove pookie (owner/admin)")
+async def slash_remove_pookie(interaction: discord.Interaction, user: discord.User):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    d = reload_data()
+    if int(user.id) in d["pookies"]:
+        d["pookies"].remove(int(user.id))
+        save_data(d)
+        return await interaction.response.send_message(f"✅ {user.mention} removed from pookie.", ephemeral=True)
+    await interaction.response.send_message("User not a pookie.", ephemeral=True)
+
+
+@tree.command(name="listpookie", description="List pookies (owner/admin)")
+async def slash_list_pookie(interaction: discord.Interaction):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    d = reload_data()
+    mentions = [f"<@{uid}>" for uid in d.get("pookies", [])]
+    await interaction.response.send_message("Pookies:\n" + (("\n".join(mentions)) or "None"), ephemeral=True)
+
+
+# -------------------------
+# SHOWCOMMANDS interactive
+# -------------------------
+CATEGORIES = {
+    "Fun": ["cat", "8ball", "joke", "dadjoke", "coinflip", "rolldice", "rps", "avatar", "userinfo"],
+    "Moderation": ["ban", "kick", "purge", "say", "say_admin"],
+    "Management": ["add_admin", "remove_admin", "show_admins", "addpookie", "removepookie", "listpookie", "set_log_channel", "disable_log_channel", "logs"],
+    "Cats": ["cat", "setcatchannel", "sethourlycatchannel"],
+}
+
+
+class ShowCommandsView(discord.ui.View):
+    def __init__(self, user: discord.User):
+        super().__init__(timeout=120)
+        self.user = user
+
+    @discord.ui.select(placeholder="Choose category", options=[discord.SelectOption(label=k) for k in CATEGORIES.keys()])
+    async def select_cb(self, interaction: discord.Interaction, select: discord.ui.Select):
+        cat = select.values[0]
+        items = CATEGORIES.get(cat, [])
+        filtered = []
+        for c in items:
+            if c in ["add_admin", "remove_admin", "addpookie", "removepookie", "listpookie", "set_log_channel", "disable_log_channel", "logs"]:
+                if not is_admin_user(interaction.user.id):
+                    continue
+            filtered.append(c)
+        text = f"**{cat}**\n" + (", ".join(f"`/{x}`" for x in filtered) if filtered else "No commands you can use here.")
+        await interaction.response.edit_message(content=text, view=self)
+
+
+@tree.command(name="showcommands", description="Interactive list of commands you can use")
+async def slash_showcommands(interaction: discord.Interaction):
+    view = ShowCommandsView(interaction.user)
+    await interaction.response.send_message("Choose a category:", view=view, ephemeral=True)
+
+
+# -------------------------
+# FUN: 8ball, jokes, coin, dice, rps
+# -------------------------
+@tree.command(name="8ball", description="Ask the magic 8-ball")
+async def slash_8ball(interaction: discord.Interaction, *, question: str):
     answers = ["Yes.", "No.", "Maybe.", "Absolutely!", "Ask again later.", "Definitely not.", "Probably.", "Unlikely."]
-    await inter.response.send_message(f"🎱 {random.choice(answers)}")
+    await interaction.response.send_message(f"🎱 {random.choice(answers)}")
+
 
 @bot.command(name="8ball")
 async def prefix_8ball(ctx: commands.Context, *, question: str):
     answers = ["Yes.", "No.", "Maybe.", "Absolutely!", "Ask again later.", "Definitely not.", "Probably.", "Unlikely."]
     await ctx.reply(f"🎱 {random.choice(answers)}", mention_author=False)
 
-@tree.command(name="joke", description="Tell a joke.")
-@blacklist_check()
-async def slash_joke(inter: discord.Interaction):
-    jokes = ["I told my computer I needed a break, and it said 'No problem — I'll go to sleep.'", "Why do programmers prefer dark mode? Because light attracts bugs.", "There are 10 types of people: those who understand binary and those who don't."]
-    await inter.response.send_message(random.choice(jokes))
 
-@tree.command(name="dadjoke", description="Tell a dad joke.")
-@blacklist_check()
-async def slash_dadjoke(inter: discord.Interaction):
-    jokes = ["I used to play piano by ear, but now I use my hands.", "Why don't eggs tell jokes? They'd crack each other up."]
-    await inter.response.send_message(random.choice(jokes))
+@tree.command(name="joke", description="Tell a joke")
+async def slash_joke(interaction: discord.Interaction):
+    jokes = ["I told my computer I needed a break, and it said 'No problem — I'll go to sleep.'",
+             "Why do programmers prefer dark mode? Because light attracts bugs."]
+    await interaction.response.send_message(random.choice(jokes))
 
-@tree.command(name="coinflip", description="Flip a coin.")
-@blacklist_check()
-async def slash_coin(inter: discord.Interaction):
-    await inter.response.send_message("Heads" if random.random() < 0.5 else "Tails")
 
-@tree.command(name="rolldice", description="Roll a dice (1-6).")
-@blacklist_check()
-async def slash_dice(inter: discord.Interaction):
-    await inter.response.send_message(f"🎲 {random.randint(1,6)}")
+@tree.command(name="dadjoke", description="Tell a dad joke")
+async def slash_dadjoke(interaction: discord.Interaction):
+    jokes = ["I used to play piano by ear, now I use my hands.", "Why don't eggs tell jokes? They'd crack each other up."]
+    await interaction.response.send_message(random.choice(jokes))
 
+
+@tree.command(name="coinflip", description="Flip a coin")
+async def slash_coin(interaction: discord.Interaction):
+    await interaction.response.send_message("Heads" if random.random() < 0.5 else "Tails")
+
+
+@tree.command(name="rolldice", description="Roll a dice (1-6)")
+async def slash_dice(interaction: discord.Interaction):
+    await interaction.response.send_message(f"🎲 {random.randint(1,6)}")
+
+
+# rps using choices decorator (supported)
 @app_commands.choices(choice=[
     app_commands.Choice(name="rock", value="rock"),
     app_commands.Choice(name="paper", value="paper"),
-    app_commands.Choice(name="scissors", value="scissors")
+    app_commands.Choice(name="scissors", value="scissors"),
 ])
 @tree.command(name="rps", description="Rock Paper Scissors")
-@blacklist_check()
-async def slash_rps(inter: discord.Interaction, choice: app_commands.Choice[str]):
-    bot_choice = random.choice(["rock","paper","scissors"])
+async def slash_rps(interaction: discord.Interaction, choice: app_commands.Choice[str]):
+    bot_choice = random.choice(["rock", "paper", "scissors"])
     user = choice.value
     result = "draw"
-    if (user, bot_choice) in [("rock","scissors"), ("paper","rock"), ("scissors","paper")]:
-        result = "you win!"
+    if (user, bot_choice) in [("rock", "scissors"), ("paper", "rock"), ("scissors", "paper")]:
+        result = "You win!"
     elif user != bot_choice:
-        result = "you lose!"
-    await inter.response.send_message(f"You: **{user}**, Bot: **{bot_choice}** → {result}")
+        result = "You lose!"
+    await interaction.response.send_message(f"You: **{user}** | Bot: **{bot_choice}** → {result}")
 
-# ------------------------- TRIGGERS -------------------------
-@tree.command(name="trigger_add", description="Add exact-word trigger (admin).")
-@owner_or_admin_check()
-@app_commands.describe(word="Exact word", reply="Reply text (use {user} to mention)")
-async def slash_trigger_add(inter: discord.Interaction, word: str, reply: str):
-    d = reload_data()
-    d.setdefault("triggers", {})
-    d["triggers"][word.lower()] = reply
-    save_data(d)
-    await inter.response.send_message(f"Trigger for `{word}` added.")
 
-@tree.command(name="trigger_remove", description="Remove trigger (admin).")
-@owner_or_admin_check()
-@app_commands.describe(word="Word to remove")
-async def slash_trigger_remove(inter: discord.Interaction, word: str):
-    d = reload_data()
-    if word.lower() in d.get("triggers", {}):
-        d["triggers"].pop(word.lower(), None)
-        save_data(d)
-        return await inter.response.send_message(f"Removed trigger `{word}`")
-    await inter.response.send_message("Trigger not found.", ephemeral=True)
-
-@tree.command(name="showtrigger", description="Show triggers (admin).")
-@owner_or_admin_check()
-async def slash_show_trigger(inter: discord.Interaction):
-    d = reload_data()
-    t = d.get("triggers", {})
-    if not t:
-        return await inter.response.send_message("No triggers.")
-    text = "\n".join(f"`{k}` → `{v}`" for k, v in t.items())
-    await inter.response.send_message(text[:1900])
-
-# ------------------------- AFK -------------------------
-@tree.command(name="afk", description="Set AFK with reason.")
-async def slash_afk(inter: discord.Interaction, reason: str = "AFK"):
-    d = reload_data()
-    d.setdefault("afk", {})
-    d["afk"][str(inter.user.id)] = {"reason": reason, "since": datetime.now(timezone.utc).isoformat()}
-    save_data(d)
-    await inter.response.send_message(f"AFK set: **{sanitize_no_mentions(reason)}**", ephemeral=True)
-
-@tree.command(name="afk_clear", description="Clear your AFK.")
-async def slash_afk_clear(inter: discord.Interaction):
-    d = reload_data()
-    if str(inter.user.id) in d.get("afk", {}):
-        d["afk"].pop(str(inter.user.id), None)
-        save_data(d)
-        return await inter.response.send_message("AFK removed.", ephemeral=True)
-    await inter.response.send_message("You were not AFK.", ephemeral=True)
-
-# ------------------------- SHOWCOMMANDS -------------------------
-CATEGORIES = {
-    "Fun": ["cat","8ball","joke","dadjoke","coinflip","rolldice","rps","avatar","userinfo"],
-    "Moderation": ["ban","kick","purge","say","say_admin","blocked_add","blocked_remove"],
-    "Management": ["add_admin","remove_admin","show_admins","addpookie","removepookie","listpookie","blacklist","unblacklist","set_log_channel","disable_log_channel","logs"],
-    "Logging": ["set_log_channel","disable_log_channel","logs"],
-    "Cats": ["cat","setcatchannel","sethourlycatchannel"]
-}
-
-class ShowView(discord.ui.View):
-    def __init__(self, user: discord.User):
-        super().__init__(timeout=60)
-        self.user = user
-
-    @discord.ui.select(placeholder="Pick a category", options=[discord.SelectOption(label=k) for k in CATEGORIES.keys()])
-    async def select_cat(self, inter: discord.Interaction, select: discord.ui.Select):
-        cat = select.values[0]
-        items = CATEGORIES.get(cat, [])
-        filtered = []
-        for c in items:
-            # check admin-only commands and hide if not admin
-            if c in ["add_admin","remove_admin","addpookie","removepookie","listpookie","blacklist","unblacklist","set_log_channel","disable_log_channel","logs"]:
-                if not is_admin_user(inter.user):
-                    continue
-            filtered.append(c)
-        txt = f"**{cat}**\n" + (", ".join(f"`/{x}`" for x in filtered) if filtered else "No commands you can use here.")
-        await inter.response.edit_message(content=txt, view=self)
-
-@tree.command(name="showcommands", description="Interactive list of commands you can use.")
-@blacklist_check()
-async def slash_showcommands(inter: discord.Interaction):
-    view = ShowView(inter.user)
-    await inter.response.send_message("Choose a category:", view=view, ephemeral=True)
-
-# ------------------------- ASK FOR COMMAND -------------------------
-@tree.command(name="askforcommand", description="Ask owner for a command (DM + log).")
-@blacklist_check()
-@app_commands.describe(request="Describe command you want")
-async def slash_askforcommand(inter: discord.Interaction, request: str):
-    owner = await bot.fetch_user(OWNER_ID)
-    content = f"**Command request** from {inter.user} ({inter.user.id}) in {inter.guild.name if inter.guild else 'DM'}:\n{request}"
-    try:
-        await owner.send(content)
-    except Exception:
-        pass
-    await send_log_embed(inter.guild, "Command Request", content)
-    await inter.response.send_message("Sent your request to the owner (or logged it).", ephemeral=True)
-
-# ------------------------- DEBUG / REFRESH / RESTART -------------------------
-@tree.command(name="refreshcommands", description="Refresh slash commands (owner/admin).")
-@owner_or_admin_check()
-async def slash_refresh(inter: discord.Interaction):
-    try:
-        await tree.sync()
-        await inter.response.send_message("Slash commands refreshed.", ephemeral=True)
-        add_file_log("admin", f"{inter.user} refreshed slash commands")
-    except Exception as e:
-        await inter.response.send_message(f"Failed: {e}", ephemeral=True)
-
-@tree.command(name="restart", description="Restart the bot process (owner/admin).")
-@owner_or_admin_check()
-async def slash_restart(inter: discord.Interaction):
-    await inter.response.send_message("Restarting...", ephemeral=True)
-    add_file_log("admin", f"{inter.user} requested restart")
-    # If Render set up, process exit will restart container; otherwise will restart on host
-    os._exit(0)
-
-@tree.command(name="debug", description="Show debug info (owner/admin).")
-@owner_or_admin_check()
-async def slash_debug(inter: discord.Interaction):
-    mem = "N/A"
-    try:
-        import psutil
-        proc = psutil.Process(os.getpid())
-        mem = f"{proc.memory_info().rss/(1024*1024):.1f} MiB"
-    except Exception:
-        mem = "psutil not installed"
-    emb = discord.Embed(title="Debug", color=discord.Color.teal())
-    emb.add_field(name="Uptime", value=str(datetime.now(timezone.utc).isoformat()), inline=False)
-    emb.add_field(name="Guilds", value=str(len(bot.guilds)))
-    emb.add_field(name="Latency", value=f"{round(bot.latency*1000)} ms")
-    emb.add_field(name="Memory", value=mem)
-    emb.add_field(name="Python", value=platform.python_version())
-    emb.add_field(name="d.py", value=discord.__version__)
-    await inter.response.send_message(embed=emb, ephemeral=True)
-
-# ------------------------- AVATAR / USERINFO / GUILDINFO -------------------------
-@tree.command(name="avatar", description="Show a user's avatar.")
-@blacklist_check()
-async def slash_avatar(inter: discord.Interaction, user: Optional[discord.User] = None):
-    u = user or inter.user
-    emb = discord.Embed(title=f"{u} avatar")
+# -------------------------
+# AVATAR / USERINFO / GUILDINFO
+# -------------------------
+@tree.command(name="avatar", description="Show a user's avatar")
+async def slash_avatar(interaction: discord.Interaction, user: Optional[discord.User] = None):
+    u = user or interaction.user
+    emb = discord.Embed(title=f"{u} — Avatar", color=discord.Color.green())
     emb.set_image(url=u.display_avatar.url)
-    await inter.response.send_message(embed=emb)
+    await interaction.response.send_message(embed=emb)
 
-@tree.command(name="userinfo", description="Show user information (mention or id).")
-@blacklist_check()
-async def slash_userinfo(inter: discord.Interaction, user: Optional[discord.User] = None, user_id: Optional[str] = None):
-    target = user
-    if not target and user_id:
-        try:
-            target = await bot.fetch_user(int(user_id))
-        except Exception:
-            pass
-    if not target:
-        target = inter.user
-    emb = discord.Embed(title=f"User info: {target}")
-    emb.add_field(name="ID", value=str(target.id))
-    emb.add_field(name="Bot?", value=str(target.bot))
-    emb.set_thumbnail(url=target.display_avatar.url)
-    await inter.response.send_message(embed=emb)
 
-@tree.command(name="guildinfo", description="Show info about a guild by ID (owner/admin).")
-@owner_or_admin_check()
-async def slash_guildinfo(inter: discord.Interaction, guild_id: str):
+@tree.command(name="userinfo", description="Show information about a user")
+async def slash_userinfo(interaction: discord.Interaction, user: Optional[discord.User] = None):
+    u = user or interaction.user
+    emb = discord.Embed(title=f"{u}", color=discord.Color.blurple())
+    emb.add_field(name="ID", value=str(u.id))
+    emb.add_field(name="Bot?", value=str(u.bot))
+    emb.set_thumbnail(url=u.display_avatar.url)
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+@tree.command(name="guildinfo", description="Show guild info by id (admin)")
+async def slash_guildinfo(interaction: discord.Interaction, guild_id: str):
+    if not is_admin_user(interaction.user.id):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
     try:
         gid = int(guild_id)
     except Exception:
-        return await inter.response.send_message("Invalid guild ID.", ephemeral=True)
+        return await interaction.response.send_message("Invalid guild id.", ephemeral=True)
     g = bot.get_guild(gid)
     if not g:
-        return await inter.response.send_message("Not in that guild.", ephemeral=True)
-    invite = None
+        return await interaction.response.send_message("Bot is not in that guild.", ephemeral=True)
+    inv = None
     try:
         for ch in g.text_channels:
             if ch.permissions_for(g.me).create_instant_invite:
-                inv = await ch.create_invite(max_age=3600, max_uses=1, unique=True)
-                invite = str(inv)
+                inv_obj = await ch.create_invite(max_age=3600, max_uses=1, unique=True)
+                inv = str(inv_obj)
                 break
     except Exception:
-        invite = None
-    emb = discord.Embed(title=f"Guild: {g.name}", color=discord.Color.gold())
+        inv = None
+    emb = discord.Embed(title=f"{g.name}", color=discord.Color.gold())
     emb.add_field(name="ID", value=str(g.id))
     emb.add_field(name="Owner", value=f"{g.owner} ({g.owner_id})")
     emb.add_field(name="Members", value=str(g.member_count))
     emb.add_field(name="Channels", value=f"{len(g.text_channels)} text / {len(g.voice_channels)} voice")
-    emb.add_field(name="Created", value=str(g.created_at))
-    if invite:
-        emb.add_field(name="Invite (1 hour)", value=invite)
-    await inter.response.send_message(embed=emb, ephemeral=True)
+    if inv:
+        emb.add_field(name="Invite (1h)", value=inv)
+    await interaction.response.send_message(embed=emb, ephemeral=True)
 
-# ------------------------- SNIPE PREFIX (optional) -------------------------
-@bot.command(name="snipe")
-async def snipe_prefix(ctx: commands.Context):
-    items = SNIPES.get(ctx.channel.id, [])
-    if not items:
-        return await ctx.reply("Nothing to snipe here.", mention_author=False)
-    view = SnipeView(items)
-    m = await ctx.reply(embed=view.make_embed(), view=view, mention_author=False)
-    # ephemeral not available in prefix
 
-# ------------------------- COMMANDS MISSING (say_admin prefix, avatar prefix, userinfo prefix) -------------------------
-@bot.command(name="say_admin")
-async def say_admin_prefix(ctx: commands.Context, *, text: str):
-    if not is_admin_user(ctx.author) and not is_pookie_user(ctx.author):
-        return await ctx.reply("Admins only.", mention_author=False)
-    await ctx.send(text)
-    add_file_log("command", f"{ctx.author} used ?say_admin")
-    await send_log_embed(ctx.guild, "Say Admin", f"{ctx.author.mention} used say_admin in {ctx.channel.mention}\n```{text[:900]}```")
+# -------------------------
+# START BOT
+# -------------------------
+# ensure data file exists & owner present
+_data = reload_data()
+if OWNER_ID not in _data.get("admins", []):
+    _data["admins"].append(int(OWNER_ID))
+    for aid in DEFAULT_EXTRA_ADMINS:
+        if aid not in _data["admins"]:
+            _data["admins"].append(int(aid))
+    save_data(_data)
 
-@bot.command(name="avatar")
-async def avatar_prefix(ctx: commands.Context, user: Optional[discord.User] = None):
-    u = user or ctx.author
-    emb = discord.Embed(title=f"{u} avatar")
-    emb.set_image(url=u.display_avatar.url)
-    await ctx.send(embed=emb)
 
-@bot.command(name="userinfo")
-async def userinfo_prefix(ctx: commands.Context, user: Optional[discord.Member] = None):
-    m = user or ctx.author
-    roles = [r.name for r in m.roles if r.name != "@everyone"]
-    emb = discord.Embed(title=f"{m} — Member Info")
-    emb.add_field(name="ID", value=str(m.id))
-    emb.add_field(name="Created", value=str(m.created_at))
-    if m.joined_at:
-        emb.add_field(name="Joined", value=str(m.joined_at))
-    emb.add_field(name="Roles", value=", ".join(roles) or "None")
-    await ctx.send(embed=emb)
-
-# ------------------------- AUTO-RESPONDER TRIGGER PREFIX COMMANDS -------------------------
-@bot.command(name="trigger_add")
-async def prefix_trigger_add(ctx: commands.Context, word: str, *, reply: str):
-    if not is_admin_user(ctx.author):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    d.setdefault("triggers", {})
-    d["triggers"][word.lower()] = reply
-    save_data(d)
-    await ctx.reply(f"Trigger `{word}` added.", mention_author=False)
-
-@bot.command(name="trigger_remove")
-async def prefix_trigger_remove(ctx: commands.Context, word: str):
-    if not is_admin_user(ctx.author):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    if word.lower() in d.get("triggers", {}):
-        d["triggers"].pop(word.lower(), None)
-        save_data(d)
-        return await ctx.reply(f"Trigger `{word}` removed.", mention_author=False)
-    await ctx.reply("Not found.", mention_author=False)
-
-# ------------------------- WRAP UP & RUN -------------------------
-# Ensure data persisted on exit
-def _on_exit():
+def _run_bot():
     try:
-        save_data(DATA)
-    except Exception:
-        pass
-
-atexit.register(_on_exit)
-
-# Main runner
-async def main():
-    try:
-        await bot.start(DISCORD_TOKEN)
-    except KeyboardInterrupt:
-        await bot.close()
+        bot.run(DISCORD_TOKEN)
     except Exception as e:
-        print("Bot start error:", e)
+        print("Bot run error:", e)
         raise
 
+
 if __name__ == "__main__":
-    # sanity: ensure data file exists and owner/admins present
-    d = reload_data()
-    if OWNER_ID not in d["admins"]:
-        d["admins"].append(int(OWNER_ID))
-        for aid in DEFAULT_EXTRA_ADMINS:
-            if aid not in d["admins"]:
-                d["admins"].append(int(aid))
-        save_data(d)
-    asyncio.run(main())
+    _run_bot()
