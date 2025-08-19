@@ -1,25 +1,23 @@
-# Use an official Python image
+# Dockerfile for running on Render
 FROM python:3.11-slim
 
-# Set the working directory inside the container
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# Install system deps (for some Python packages)
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends build-essential curl git \
+  && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements.txt and install dependencies
+# Copy and install dependencies
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the bot’s code
+# Copy app
 COPY . .
 
-# Expose Flask port (Render expects 10000 by default for free web services)
-EXPOSE 10000
+# Expose port for Flask keepalive
+EXPOSE 8080
 
-# Run both Flask keepalive and your bot
+ENV PYTHONUNBUFFERED=1
+
 CMD ["python", "main.py"]
