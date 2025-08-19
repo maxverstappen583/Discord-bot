@@ -1,20 +1,27 @@
-# Use slim Python 3.11 (has audioop back)
+# Use the official lightweight Python image
 FROM python:3.11-slim
 
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Set work directory
 WORKDIR /app
 
-# System deps (optional but useful)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates build-essential curl git && \
-    rm -rf /var/lib/apt/lists/*
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy project files
 COPY . .
 
-# Default port for Flask healthcheck (Render will ping it)
-ENV PORT=10000
+# Expose Flask port
+EXPOSE 8080
 
-# Start your bot (Flask thread runs inside main.py)
+# Run bot
 CMD ["python", "main.py"]
