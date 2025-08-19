@@ -1,28 +1,25 @@
-# Use official Python image
+# Use an official Python image
 FROM python:3.11-slim
 
-# Set working directory
+# Set the working directory inside the container
 WORKDIR /app
 
-# Install system dependencies (for pip & discord.py)
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for caching
+# Copy requirements.txt and install dependencies
 COPY requirements.txt .
 
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the app
+# Copy the rest of the bot’s code
 COPY . .
 
-# Expose Flask port (for keepalive)
-EXPOSE 8080
+# Expose Flask port (Render expects 10000 by default for free web services)
+EXPOSE 10000
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
-
-# Run both Flask keepalive + Discord bot
+# Run both Flask keepalive and your bot
 CMD ["python", "main.py"]
