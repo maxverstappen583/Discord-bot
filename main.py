@@ -1314,7 +1314,7 @@ async def slash_debug(inter:discord.Interaction):
     e.add_field(name="RAM(MB)", value=f"{mem:.1f}")
     e.add_field(name="Python", value=platform.python_version())
     e.add_field(name="discord.py", value=discord.__version__)
-    await inter.response.send_message(embed=e, ephemeral=# ---------------------------
+    await inter.response.send_message(embed=e, ephemeral=# ---------------------------)
 
 # LOAD COGS
 # ---------------------------
