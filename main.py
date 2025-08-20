@@ -1,92 +1,90 @@
-# main.py — full single-file bot
-# Features: prefix ? + slash / hybrid commands, admin/pookie system, blacklist,
-# blocked words, triggers, AFK, snipe/esnipe, logs (every event), daily/hourly cats,
-# say/say_admin, moderation, warns, temp roles, restart via Render API, Flask keepalive.
+# main.py  —  Full Bot (automod, trusted users, per-guild logs, /log timeline, interactive /automod UI)
+# Save as main.py
+# Requirements: discord.py 2.3.2, aiohttp, Flask, python-dotenv (optional), psutil (optional for debug)
+# Env vars (Render): DISCORD_BOT_TOKEN (required), OWNER_ID (optional), CAT_API_KEY, RENDER_API_KEY, RENDER_SERVICE_ID, TZ, PORT
 
-import os
-import sys
-import json
-import re
-import random
-import asyncio
-import aiohttp
-import traceback
+import os, re, json, random, asyncio, traceback, platform
 from datetime import datetime, timezone, timedelta
 from threading import Thread
 from typing import Optional, Dict, Any, List
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from flask import Flask
 
-# ---------------------------
-# ENV
-# ---------------------------
+# -----------------------
+# Environment & defaults
+# -----------------------
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 if not DISCORD_TOKEN:
-    raise RuntimeError("DISCORD_BOT_TOKEN environment variable is required")
+    raise RuntimeError("DISCORD_BOT_TOKEN environment variable required")
 
-# Owner and default admins
 try:
-    OWNER_ID = int(os.getenv("OWNER_ID", "1319292111325106296"))
+    OWNER_ID = int(os.getenv("OWNER_ID", "1319292111325106296").strip())
 except Exception:
     OWNER_ID = 1319292111325106296
-
-# Additional default admins to keep always present
-DEFAULT_EXTRA_ADMINS = {1380315427992768633, 909468887098216499}
 
 CAT_API_KEY = os.getenv("CAT_API_KEY", "").strip()
 RENDER_API_KEY = os.getenv("RENDER_API_KEY", "").strip()
 RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "").strip()
-
 TZ_NAME = os.getenv("TZ", "Asia/Kolkata").strip() or "Asia/Kolkata"
+
 try:
     BOT_TZ = ZoneInfo(TZ_NAME)
 except Exception:
     BOT_TZ = ZoneInfo("Asia/Kolkata")
 
-# Flask port (Render sets PORT)
 FLASK_PORT = int(os.getenv("PORT", os.getenv("FLASK_PORT", "8080")))
 
 DATA_FILE = "data.json"
-SNIPES_KEEP = 150
-LOGS_KEEP = 3000
+SNIPES_KEEP = 200
+LOGS_KEEP = 5000
 
-# ---------------------------
-# FLASK KEEPALIVE
-# ---------------------------
-flask_app = Flask("bot_keepalive")
+# -----------------------
+# Flask keepalive
+# -----------------------
+flask_app = Flask("keepalive")
 
 
 @flask_app.route("/")
-def alive():
+def home():
     return "OK", 200
 
 
-def _run_flask():
+def run_flask():
     flask_app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False)
 
 
-Thread(target=_run_flask, daemon=True).start()
+Thread(target=run_flask, daemon=True).start()
 
-# ---------------------------
-# DATA PERSISTENCE
-# ---------------------------
+# -----------------------
+# Data structure
+# -----------------------
+DEFAULT_AUTOMOD = {
+    "anti_link": True,
+    "anti_invite": True,
+    "anti_spam": {"enabled": True, "action": "delete", "threshold": 5, "interval": 6},
+    "blocked_words_enabled": True,
+    "trusted_users": []  # user ids
+}
+
 DEFAULT_DATA = {
-    "admins": [],            # ints
-    "pookies": [],           # ints
-    "blacklist": [],         # ints
-    "blocked_words": [],     # strings
-    "triggers": {},          # word -> reply
-    "log_channel": None,     # int
-    "cat_channel": None,     # daily 11:00 local
-    "hourly_cat_channel": None,
-    "logs": [],              # list of dicts
-    "afk": {},               # user_id -> {"reason","since"}
-    "warns": {},             # user_id -> list
-    "temp_roles": []         # list of dicts
+    "admins": [OWNER_ID],
+    "pookies": [],
+    "blacklist": [],
+    "blocked_words": [],      # list of strings
+    "triggers": {},           # word -> reply
+    "log_channels": {},       # guild_id -> channel_id
+    "cat_channels": {},       # guild_id -> channel_id (daily)
+    "hourly_cat_channels": {},# guild_id -> channel_id (hourly)
+    "logs": [],               # list of structured log dicts
+    "afk": {},                # user_id_str -> {reason, since_iso}
+    "warns": {},              # user_id_str -> [warns]
+    "temp_roles": [],         # list of {guild_id,user_id,role_id,expires_at_iso}
+    "automod": {}             # guild_id -> automod_config (see DEFAULT_AUTOMOD)
 }
 
 
@@ -95,15 +93,12 @@ def save_data(d: Dict[str, Any]):
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print("Failed to save data:", e)
+        print("save_data error:", e)
 
 
 def load_data() -> Dict[str, Any]:
     if not os.path.exists(DATA_FILE):
-        d = DEFAULT_DATA.copy()
-        d["admins"] = list({OWNER_ID} | DEFAULT_EXTRA_ADMINS)
-        save_data(d)
-        return d
+        save_data(DEFAULT_DATA.copy())
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
@@ -113,308 +108,620 @@ def load_data() -> Dict[str, Any]:
     for k, v in DEFAULT_DATA.items():
         if k not in d:
             d[k] = v.copy() if isinstance(v, (list, dict)) else v
-    # ensure owner present
-    admins_set = set(map(int, d.get("admins", [])))
-    admins_set.add(int(OWNER_ID))
-    admins_set |= DEFAULT_EXTRA_ADMINS
-    d["admins"] = list(admins_set)
+    # ensure owner in admins
+    if OWNER_ID not in d.get("admins", []):
+        d["admins"].append(OWNER_ID)
     return d
 
 
-DATA = load_data()
+DATA: Dict[str, Any] = load_data()
 
-
-def reload_data():
+def reload_data() -> Dict[str, Any]:
     global DATA
     DATA = load_data()
     return DATA
 
-
-# ---------------------------
-# HELPERS
-# ---------------------------
-def is_owner(uid: int) -> bool:
-    return int(uid) == int(OWNER_ID)
-
-
-def is_admin(uid: int) -> bool:
-    d = reload_data()
-    return int(uid) in set(map(int, d.get("admins", []))) or is_owner(uid)
-
-
-def is_pookie(uid: int) -> bool:
-    d = reload_data()
-    return int(uid) in set(map(int, d.get("pookies", []))) or is_admin(uid)
-
-
-def is_blacklisted(uid: int) -> bool:
-    d = reload_data()
-    return int(uid) in set(map(int, d.get("blacklist", [])))
-
-
-def sanitize_no_mentions(text: str) -> str:
+# -----------------------
+# Helper utilities
+# -----------------------
+def sanitize_no_ping(text: str) -> str:
     return text.replace("@", "@\u200b")
 
+def human_delta(dt: datetime) -> str:
+    now = datetime.now(timezone.utc)
+    diff = now - dt
+    days = diff.days
+    s = diff.seconds
+    hours, rem = divmod(s, 3600)
+    minutes, seconds = divmod(rem, 60)
+    parts = []
+    if days: parts.append(f"{days}d")
+    if hours: parts.append(f"{hours}h")
+    if minutes: parts.append(f"{minutes}m")
+    if seconds and not parts: parts.append(f"{seconds}s")
+    return " ".join(parts) if parts else "0s"
 
-def exact_word_present(text: str, word: str) -> bool:
-    pattern = r"\b" + re.escape(word) + r"\b"
-    return re.search(pattern, text, flags=re.IGNORECASE) is not None
+def account_age(user: discord.abc.Snowflake) -> str:
+    try:
+        created = user.created_at
+        return human_delta(created)
+    except Exception:
+        return "Unknown"
 
+def member_join_age(member: discord.Member) -> str:
+    try:
+        return human_delta(member.joined_at) if member.joined_at else "Unknown"
+    except Exception:
+        return "Unknown"
 
-def add_log(kind: str, message: str):
+def ensure_guild_automod(guild_id: int) -> Dict[str, Any]:
     d = reload_data()
-    entry = {"ts": datetime.now(timezone.utc).isoformat(), "kind": kind, "message": message}
+    autos = d.setdefault("automod", {})
+    gk = str(guild_id)
+    if gk not in autos:
+        autos[gk] = DEFAULT_AUTOMOD.copy()
+        save_data(d)
+    return autos[gk]
+
+def is_trusted_user(guild_id: int, user_id: int) -> bool:
+    auto = ensure_guild_automod(guild_id)
+    trusted = set(map(int, auto.get("trusted_users", [])))
+    return user_id in trusted
+
+# -----------------------
+# Structured logs
+# -----------------------
+def add_log(guild_id: Optional[int], action: str, actor_id: Optional[int], target_id: Optional[int], details: Dict[str, Any]):
+    """
+    Stores a normalized log entry in DATA['logs'] and trims history.
+    details can include message_id, channel_id, content, attachments(list), reason, punishment, etc.
+    """
+    d = reload_data()
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "guild_id": str(guild_id) if guild_id else None,
+        "action": action,            # e.g., "message_delete","member_join","role_add","automod_link"
+        "actor_id": int(actor_id) if actor_id else None,
+        "target_id": int(target_id) if target_id else None,
+        "details": details or {}
+    }
     d.setdefault("logs", [])
     d["logs"].append(entry)
     if len(d["logs"]) > LOGS_KEEP:
         d["logs"] = d["logs"][-LOGS_KEEP:]
     save_data(d)
 
-
-async def send_log_embed(title: str, description: str):
+async def send_log_embed_for_entry(entry: Dict[str, Any]):
+    """ Format and send a rich embed to the configured log channel for the entry's guild. """
     d = reload_data()
-    ch_id = d.get("log_channel")
+    gid = entry.get("guild_id")
+    if not gid:
+        return
+    ch_map = d.get("log_channels", {})
+    ch_id = ch_map.get(gid)
     if not ch_id:
         return
     ch = bot.get_channel(int(ch_id))
     if not ch:
         return
-    emb = discord.Embed(title=title, description=description, color=discord.Color.dark_gold(),
-                        timestamp=datetime.now(timezone.utc))
+    action = entry.get("action", "log")
+    actor_id = entry.get("actor_id")
+    target_id = entry.get("target_id")
+    details = entry.get("details", {}) or {}
+    ts = entry.get("ts")
+    embed = discord.Embed(timestamp=datetime.fromisoformat(ts), color=discord.Color.blurple())
+
+    # helper to format user display without ping
+    def fmt_user(uid):
+        try:
+            u = bot.get_user(int(uid))
+            if u:
+                return f"{sanitize_no_ping(str(u))} (`{u.id}`)", u.display_avatar.url
+        except Exception:
+            pass
+        return f"`{uid}`", None
+
+    # Action-specific formatting
+    if action == "member_join":
+        embed.title = "🟢 Member Joined"
+        info, avatar = fmt_user(target_id)
+        embed.description = f"{info}"
+        embed.add_field(name="User ID", value=f"`{target_id}`", inline=True)
+        embed.add_field(name="Account age", value=details.get("account_age","Unknown"), inline=True)
+        embed.add_field(name="Member Count", value=str(details.get("member_count","Unknown")), inline=True)
+        if avatar:
+            embed.set_thumbnail(url=avatar)
+    elif action == "member_leave":
+        embed.title = "⚪ Member Left"
+        info, avatar = fmt_user(target_id)
+        embed.description = f"{info}\nRoles: {details.get('roles','None')}"
+        embed.add_field(name="User ID", value=f"`{target_id}`", inline=True)
+        embed.add_field(name="Account age", value=details.get("account_age","Unknown"), inline=True)
+        embed.add_field(name="Time in server", value=details.get("time_in_server","Unknown"), inline=True)
+        if avatar:
+            embed.set_thumbnail(url=avatar)
+    elif action in ("ban","kick","timeout"):
+        embed.title = f"⛔ {action.capitalize()}"
+        info, avatar = fmt_user(target_id)
+        embed.description = f"{info}\nReason: {details.get('reason','No reason')}"
+        embed.add_field(name="Actor", value=f"<@{actor_id}>" if actor_id else "`Unknown`", inline=True)
+        embed.add_field(name="User ID", value=f"`{target_id}`", inline=True)
+        embed.add_field(name="Account age", value=details.get("account_age","Unknown"), inline=True)
+        if avatar:
+            embed.set_thumbnail(url=avatar)
+    elif action == "role_update":
+        embed.title = "🔁 Role Update"
+        info, avatar = fmt_user(target_id)
+        embed.description = f"{info}"
+        embed.add_field(name="Added", value=details.get("added","None"), inline=True)
+        embed.add_field(name="Removed", value=details.get("removed","None"), inline=True)
+        embed.add_field(name="Actor", value=f"<@{actor_id}>" if actor_id else "`Unknown`", inline=True)
+        if avatar:
+            embed.set_thumbnail(url=avatar)
+    elif action == "message_delete":
+        embed.title = "🗑️ Message Deleted"
+        content = details.get("content","")
+        attachments = details.get("attachments", [])
+        author_info = details.get("author_str", f"`{details.get('author_id','Unknown')}`")
+        embed.description = f"{author_info}\nChannel: {details.get('channel','Unknown')} • Message ID: `{details.get('message_id','')}`\nDeleted by: {details.get('deleted_by','Unknown')}"
+        embed.add_field(name="Message age", value=details.get("message_age","Unknown"), inline=True)
+        embed.add_field(name="Account age", value=details.get("account_age","Unknown"), inline=True)
+        if content:
+            embed.add_field(name="Content", value=(content[:1000] + "..." if len(content)>1000 else content), inline=False)
+        if attachments:
+            embed.add_field(name="Attachments", value="\n".join(attachments)[:1000], inline=False)
+    elif action.startswith("automod_"):
+        kind = action.split("_",1)[1]
+        embed.title = f"⚠️ Automod — {kind.replace('_',' ').title()}"
+        embed.add_field(name="User", value=f"<@{target_id}> (`{target_id}`)", inline=True)
+        embed.add_field(name="Action", value=details.get("punishment","deleted"), inline=True)
+        embed.add_field(name="Channel", value=details.get("channel","Unknown"), inline=True)
+        if details.get("content"):
+            embed.add_field(name="Content", value=(details.get("content")[:1000] + "...") if len(details.get("content",""))>1000 else details.get("content",""), inline=False)
+        if details.get("attachments"):
+            embed.add_field(name="Attachments", value="\n".join(details.get("attachments",[]))[:1000], inline=False)
+    else:
+        embed.title = entry.get("action", "Log")
+        embed.description = str(entry.get("details",""))
+
     try:
-        await ch.send(embed=emb)
+        await ch.send(embed=embed)
     except Exception:
+        # ignore send errors
         pass
 
+# -----------------------
+# Snipe arrays (deleted/edited)
+# -----------------------
+SNIPES: Dict[int, List[Dict[str,Any]]] = {}
+ESNIPES: Dict[int, List[Dict[str,Any]]] = {}
 
-# ---------------------------
-# SNIPE STORAGE
-# ---------------------------
-SNIPES: Dict[int, List[Dict[str, Any]]] = {}
-ESNIPES: Dict[int, List[Dict[str, Any]]] = {}
-
-
-def push_snipe(store: Dict[int, List[Dict[str, Any]]], channel_id: int, entry: Dict[str, Any]):
-    lst = store.setdefault(channel_id, [])
-    lst.append(entry)
+def push_snipe(store: Dict[int, List[Dict[str,Any]]], chan_id: int, item: Dict[str,Any]):
+    lst = store.setdefault(chan_id, [])
+    lst.append(item)
     if len(lst) > SNIPES_KEEP:
         del lst[0]
 
-
-class SnipeView(discord.ui.View):
-    def __init__(self, items: List[Dict[str, Any]]):
-        super().__init__(timeout=180)
-        self.items = items
-        self.index = len(items) - 1
-
-    def make_embed(self) -> discord.Embed:
-        d = self.items[self.index]
-        e = discord.Embed(color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
-        e.set_author(name=d.get("author_tag", "Unknown"), icon_url=d.get("avatar_url") or discord.Embed.Empty)
-        e.set_footer(text=f"{self.index+1}/{len(self.items)} • {d.get('time','')}")
-        if "content" in d:
-            e.add_field(name="Message", value=d.get("content") or "*empty*", inline=False)
-        else:
-            e.add_field(name="Before", value=d.get("before") or "*empty*", inline=False)
-            e.add_field(name="After", value=d.get("after") or "*empty*", inline=False)
-        return e
-
-    @discord.ui.button(label="⬅️", style=discord.ButtonStyle.secondary)
-    async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.index > 0:
-            self.index -= 1
-            await interaction.response.edit_message(embed=self.make_embed(), view=self)
-        else:
-            await interaction.response.defer()
-
-    @discord.ui.button(label="➡️", style=discord.ButtonStyle.secondary)
-    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.index < len(self.items) - 1:
-            self.index += 1
-            await interaction.response.edit_message(embed=self.make_embed(), view=self)
-        else:
-            await interaction.response.defer()
-
-
-# ---------------------------
-# CAT helper
-# ---------------------------
-async def fetch_random_cat_url(session: aiohttp.ClientSession) -> Optional[str]:
-    headers = {}
-    if CAT_API_KEY:
-        headers["x-api-key"] = CAT_API_KEY
+# -----------------------
+# Helper: detect deleter via audit logs (best-effort)
+# -----------------------
+async def attempt_find_deleter(guild: discord.Guild, message) -> str:
+    """
+    Best-effort: look up recent audit logs for message_delete or member_role_update etc.
+    Returns: 'bot' / 'self' / '<@id>' / 'unknown'
+    """
+    # if message was by bot
     try:
-        async with session.get("https://api.thecatapi.com/v1/images/search", headers=headers, timeout=20) as r:
-            if r.status == 200:
-                j = await r.json()
-                if isinstance(j, list) and j:
-                    return j[0].get("url")
+        if message.author and message.author.id == bot.user.id:
+            return "bot"
     except Exception:
-        return None
-    return "https://cataas.com/cat"
+        pass
+    # Attempt to read audit logs: catch any exception
+    try:
+        # look for recent audit logs (last 6 entries)
+        async for entry in guild.audit_logs(limit=6):
+            # entry.action is an enum; compare names to include message_delete / message_bulk_delete etc
+            aname = getattr(entry.action, "name", str(entry.action)).lower()
+            if "message_delete" in aname:
+                # if entry happened very recently
+                delta = (datetime.now(timezone.utc) - entry.created_at).total_seconds()
+                if delta < 15:
+                    # we can't reliably match message id but assume this is probably the one
+                    return f"<@{entry.user.id}>"
+    except Exception:
+        pass
+    # fallback: unknown (we can't reliably find)
+    return "unknown"
 
-# ---------------------------
-# BOT SETUP
-# ---------------------------
+# -----------------------
+# Automod regexes
+# -----------------------
+URL_REGEX = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+INVITE_REGEX = re.compile(r"(?:discord\.gg|discord(?:app)?\.com\/invite)\/[A-Za-z0-9\-]+", re.IGNORECASE)
+
+# spam tracker in-memory: { (guild_id, user_id) : [timestamps] }
+SPAM_TRACKER: Dict[str, List[float]] = {}
+
+# -----------------------
+# Bot Setup
+# -----------------------
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix=commands.when_mentioned_or("?"), intents=intents, help_command=None)
 BOT_START = datetime.now(timezone.utc)
 
-# scheduled housekeeping — defined but started in on_ready
-_last_daily_iso: Optional[str] = None
-_last_hourly_key: Optional[str] = None
-
+# -----------------------
+# periodic housekeeping: daily/hourly cat and temp role cleanup
+# -----------------------
+_last_daily_sent = {}
+_last_hourly_sent = {}
 
 @tasks.loop(minutes=1)
-async def minute_loop():
-    global _last_daily_iso, _last_hourly_key
-    now_local = datetime.now(BOT_TZ)
+async def housekeeping():
     d = reload_data()
-    # daily cat at 11:00 local
-    try:
-        if d.get("cat_channel") and now_local.hour == 11 and now_local.minute == 0:
-            today_iso = now_local.date().isoformat()
-            if _last_daily_iso != today_iso:
-                ch = bot.get_channel(int(d["cat_channel"]))
+    now_local = datetime.now(BOT_TZ)
+    # daily cat at 11:00
+    if now_local.hour == 11 and now_local.minute == 0:
+        date_key = now_local.date().isoformat()
+        for gid, ch_id in d.get("cat_channels", {}).items():
+            try:
+                if _last_daily_sent.get(gid) == date_key:
+                    continue
+                ch = bot.get_channel(int(ch_id))
                 if ch:
-                    try:
-                        async with aiohttp.ClientSession() as s:
-                            url = await fetch_random_cat_url(s)
-                        if url:
-                            await ch.send(url)
-                            add_log("cat_daily", f"Sent daily cat to {ch.id}")
-                            await send_log_embed("Daily Cat", f"Sent daily cat in {ch.mention}")
-                    except Exception:
-                        pass
-                _last_daily_iso = today_iso
-    except Exception:
-        pass
-
+                    async with aiohttp.ClientSession() as s:
+                        headers = {"x-api-key": CAT_API_KEY} if CAT_API_KEY else {}
+                        async with s.get("https://api.thecatapi.com/v1/images/search", headers=headers) as r:
+                            if r.status == 200:
+                                j = await r.json()
+                                url = j[0].get("url") if j else None
+                            else:
+                                url = "https://cataas.com/cat"
+                    if url:
+                        await ch.send(url)
+                        add_log(int(gid), "cat_daily", None, None, {"url":url})
+                        await send_log_embed_for_entry({
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "guild_id": str(gid),
+                            "action": "cat_daily",
+                            "actor_id": None,
+                            "target_id": None,
+                            "details": {"url": url}
+                        })
+                _last_daily_sent[gid] = date_key
+            except Exception:
+                pass
     # hourly cat at minute == 0
-    try:
-        if d.get("hourly_cat_channel") and now_local.minute == 0:
-            key = f"{now_local.date().isoformat()}-{now_local.hour}"
-            if _last_hourly_key != key:
-                ch2 = bot.get_channel(int(d["hourly_cat_channel"]))
-                if ch2:
-                    try:
-                        async with aiohttp.ClientSession() as s:
-                            url2 = await fetch_random_cat_url(s)
-                        if url2:
-                            await ch2.send(url2)
-                            add_log("cat_hourly", f"Sent hourly cat to {ch2.id}")
-                            await send_log_embed("Hourly Cat", f"Sent hourly cat in {ch2.mention}")
-                    except Exception:
-                        pass
-                _last_hourly_key = key
-    except Exception:
-        pass
-
+    if now_local.minute == 0:
+        key = f"{now_local.date().isoformat()}-{now_local.hour}"
+        for gid, ch_id in d.get("hourly_cat_channels", {}).items():
+            try:
+                if _last_hourly_sent.get(gid) == key:
+                    continue
+                ch = bot.get_channel(int(ch_id))
+                if ch:
+                    async with aiohttp.ClientSession() as s:
+                        headers = {"x-api-key": CAT_API_KEY} if CAT_API_KEY else {}
+                        async with s.get("https://api.thecatapi.com/v1/images/search", headers=headers) as r:
+                            if r.status == 200:
+                                j = await r.json()
+                                url = j[0].get("url") if j else None
+                            else:
+                                url = "https://cataas.com/cat"
+                    if url:
+                        await ch.send(url)
+                        add_log(int(gid), "cat_hourly", None, None, {"url":url})
+                        await send_log_embed_for_entry({
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "guild_id": str(gid),
+                            "action": "cat_hourly",
+                            "actor_id": None,
+                            "target_id": None,
+                            "details": {"url": url}
+                        })
+                _last_hourly_sent[gid] = key
+            except Exception:
+                pass
     # temp roles expiry
     try:
         d = reload_data()
         changed = False
         remaining = []
-        for e in d.get("temp_roles", []):
-            expires_at = e.get("expires_at")
-            if not expires_at:
-                continue
+        for entry in d.get("temp_roles", []):
+            expires = entry.get("expires_at")
             try:
-                exp_dt = datetime.fromisoformat(expires_at)
+                exp_dt = datetime.fromisoformat(expires)
             except Exception:
                 continue
             if datetime.now(timezone.utc) >= exp_dt:
                 try:
-                    g = bot.get_guild(int(e["guild_id"]))
+                    g = bot.get_guild(int(entry["guild_id"]))
                     if g:
-                        mem = g.get_member(int(e["user_id"]))
-                        role = g.get_role(int(e["role_id"]))
+                        mem = g.get_member(int(entry["user_id"]))
+                        role = g.get_role(int(entry["role_id"]))
                         if mem and role:
-                            await mem.remove_roles(role, reason="Temporary role expired")
-                            add_log("temp_role_removed", f"Removed role {role.id} from {mem.id}")
+                            await mem.remove_roles(role, reason="Temp role expired")
+                            add_log(g.id, "temp_role_expired", None, mem.id, {"role_id":role.id})
+                            await send_log_embed_for_entry({
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                                "guild_id": str(g.id),
+                                "action":"temp_role_expired",
+                                "actor_id": None,
+                                "target_id": mem.id,
+                                "details":{"role_id": role.id}
+                            })
                 except Exception:
                     pass
-                changed = True
             else:
-                remaining.append(e)
-        if changed:
+                remaining.append(entry)
+        if len(remaining) != len(d.get("temp_roles", [])):
             d["temp_roles"] = remaining
             save_data(d)
     except Exception:
         pass
 
-
-# ---------------------------
-# RENDER API deploy trigger
-# ---------------------------
-async def trigger_render_deploy(api_key: str, service_id: str) -> Dict[str, Any]:
-    url = f"https://api.render.com/v1/services/{service_id}/deploys"
-    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json", "Content-Type": "application/json"}
-    async with aiohttp.ClientSession() as s:
-        try:
-            async with s.post(url, headers=headers, json={}, timeout=30) as resp:
-                text = await resp.text()
-                try:
-                    j = await resp.json()
-                except Exception:
-                    j = {"text": text}
-                return {"status": resp.status, "body": j}
-        except Exception as e:
-            return {"status": 0, "error": str(e)}
-
-
-# ---------------------------
-# on_ready
-# ---------------------------
+# -----------------------
+# On ready
+# -----------------------
 @bot.event
 async def on_ready():
-    # streaming presence (purple). Edit the name/url as you like.
     try:
-        activity = discord.Streaming(name="Max Verstappen", url="https://twitch.tv/yourchannel")
-        await bot.change_presence(status=discord.Status.online, activity=activity)
+        await bot.tree.sync()
+    except Exception:
+        pass
+    # streaming presence (purple)
+    try:
+        act = discord.Streaming(name="Max Verstappen", url="https://twitch.tv/yourchannel")
+        await bot.change_presence(status=discord.Status.do_not_disturb, activity=act)
     except Exception:
         try:
-            await bot.change_presence(status=discord.Status.online)
+            await bot.change_presence(status=discord.Status.do_not_disturb)
+        except Exception:
+            pass
+    if not housekeeping.is_running():
+        housekeeping.start()
+    print(f"Bot ready: {bot.user} — guilds: {len(bot.guilds)}")
+    add_log(None, "bot_ready", None, None, {"guilds": len(bot.guilds)})
+    # send system start to all configured log channels (optional)
+    d = reload_data()
+    for gid_str, ch_id in d.get("log_channels", {}).items():
+        try:
+            entry = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "guild_id": gid_str,
+                "action": "system_start",
+                "actor_id": None,
+                "target_id": None,
+                "details": {"msg": "Bot restarted"}
+            }
+            await send_log_embed_for_entry(entry)
         except Exception:
             pass
 
-    # sync commands
-    try:
-        await bot.tree.sync()
-    except Exception as e:
-        print("Slash sync error:", e)
+# -----------------------
+# Event handlers & automod checks
+# -----------------------
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
 
-    # start minute loop after ready to avoid "no running loop"
-    if not minute_loop.is_running():
-        minute_loop.start()
+    d = reload_data()
+    gid = message.guild.id if message.guild else None
 
-    print(f"✅ Logged in as {bot.user} (id:{bot.user.id}) — guilds: {len(bot.guilds)}")
-    add_log("system", f"Bot ready: {bot.user} in {len(bot.guilds)} guilds")
-    await send_log_embed("System", f"Bot started and ready. {bot.user} in {len(bot.guilds)} guilds")
+    # AFK auto-clear
+    if str(message.author.id) in d.get("afk", {}):
+        d["afk"].pop(str(message.author.id), None)
+        save_data(d)
+        try:
+            await message.channel.send(f"✅ Welcome back {message.author.mention}. AFK removed.")
+        except Exception:
+            pass
+        add_log(gid, "afk_cleared", message.author.id, message.author.id, {"reason":"returned"})
 
+    # If mentions someone AFK, reply
+    if message.mentions:
+        for u in message.mentions:
+            afk = d.get("afk", {}).get(str(u.id))
+            if afk:
+                since = afk.get("since")
+                reason = afk.get("reason","AFK")
+                try:
+                    ts = int(datetime.fromisoformat(since).timestamp())
+                    await message.reply(f"{sanitize_no_ping(str(u))} is AFK — **{sanitize_no_ping(reason)}** (since <t:{ts}:R>)", mention_author=False)
+                except Exception:
+                    await message.reply(f"{sanitize_no_ping(str(u))} is AFK — **{sanitize_no_ping(reason)}**", mention_author=False)
 
-# ---------------------------
-# Events for server activity (all sent to log channel if set)
-# ---------------------------
+    # AUTOMOD: blocked words, anti_link, anti_invite, anti_spam
+    if message.guild:
+        auto = ensure_guild_automod(message.guild.id)
+        if is_trusted_user(message.guild.id, message.author.id):
+            # trusted bypass for message filters
+            pass
+        else:
+            # blocked words (normalized)
+            if auto.get("blocked_words_enabled", True) and d.get("blocked_words"):
+                content_compact = re.sub(r"[\s\-\_\.]", "", message.content.lower())
+                for bw in d.get("blocked_words", []):
+                    bwc = re.sub(r"[\s\-\_\.]", "", bw.lower())
+                    if bwc and bwc in content_compact:
+                        # delete and log
+                        try:
+                            await message.delete()
+                        except Exception:
+                            pass
+                        details = {
+                            "content": message.content,
+                            "channel": f"{message.channel.name}",
+                            "message_id": str(message.id),
+                            "author_id": message.author.id,
+                            "account_age": account_age(message.author),
+                            "attachments": [att.url for att in message.attachments]
+                        }
+                        add_log(message.guild.id, "automod_blocked_word", None, message.author.id, details)
+                        # send embed
+                        await send_log_embed_for_entry({
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "guild_id": str(message.guild.id),
+                            "action": "automod_blocked_word",
+                            "actor_id": None,
+                            "target_id": message.author.id,
+                            "details": details
+                        })
+                        return
+
+            # anti-invite
+            if auto.get("anti_invite", True):
+                if INVITE_REGEX.search(message.content):
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
+                    details = {
+                        "content": message.content,
+                        "channel": f"{message.channel.name}",
+                        "message_id": str(message.id),
+                        "author_id": message.author.id,
+                        "account_age": account_age(message.author),
+                        "attachments": [att.url for att in message.attachments]
+                    }
+                    add_log(message.guild.id, "automod_invite", None, message.author.id, details)
+                    await send_log_embed_for_entry({
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "guild_id": str(message.guild.id),
+                        "action": "automod_invite",
+                        "actor_id": None,
+                        "target_id": message.author.id,
+                        "details": details
+                    })
+                    return
+
+            # anti-link
+            if auto.get("anti_link", True):
+                if URL_REGEX.search(message.content):
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
+                    details = {
+                        "content": message.content,
+                        "channel": f"{message.channel.name}",
+                        "message_id": str(message.id),
+                        "author_id": message.author.id,
+                        "account_age": account_age(message.author),
+                        "attachments": [att.url for att in message.attachments]
+                    }
+                    add_log(message.guild.id, "automod_link", None, message.author.id, details)
+                    await send_log_embed_for_entry({
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "guild_id": str(message.guild.id),
+                        "action": "automod_link",
+                        "actor_id": None,
+                        "target_id": message.author.id,
+                        "details": details
+                    })
+                    return
+
+            # anti-spam (flood)
+            spam_cfg = auto.get("anti_spam", {"enabled": True})
+            if spam_cfg.get("enabled", True):
+                key = f"{message.guild.id}:{message.author.id}"
+                now_ts = asyncio.get_event_loop().time()
+                arr = SPAM_TRACKER.get(key, [])
+                arr = [t for t in arr if now_ts - t <= spam_cfg.get("interval", 6)]
+                arr.append(now_ts)
+                SPAM_TRACKER[key] = arr
+                if len(arr) >= int(spam_cfg.get("threshold",5)):
+                    # default action = delete
+                    action = spam_cfg.get("action","delete")
+                    # perform delete + log
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
+                    details = {
+                        "content": message.content,
+                        "channel": f"{message.channel.name}",
+                        "message_id": str(message.id),
+                        "author_id": message.author.id,
+                        "account_age": account_age(message.author),
+                        "attachments": [att.url for att in message.attachments],
+                        "count": len(arr),
+                        "action": action
+                    }
+                    add_log(message.guild.id, "automod_spam", None, message.author.id, details)
+                    await send_log_embed_for_entry({
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "guild_id": str(message.guild.id),
+                        "action": "automod_spam",
+                        "actor_id": None,
+                        "target_id": message.author.id,
+                        "details": details
+                    })
+                    # punishment not implemented here (delete) — you can later expand to mute/kick/ban
+                    SPAM_TRACKER[key] = []
+                    return
+
+    # process triggers and commands
+    # triggers: exact word detection
+    d = reload_data()
+    for word, reply in d.get("triggers", {}).items():
+        try:
+            if re.search(r"\b" + re.escape(word) + r"\b", message.content, flags=re.IGNORECASE):
+                out = reply.replace("{user}", message.author.mention)
+                out = sanitize_no_ping(out) if not is_admin(message.author.id) else out
+                await message.channel.send(out)
+                add_log(message.guild.id if message.guild else None, "trigger_fired", message.author.id, message.author.id, {"trigger":word, "reply":reply})
+                break
+        except Exception:
+            pass
+
+    await bot.process_commands(message)
+
 @bot.event
 async def on_message_delete(message: discord.Message):
-    if not message or not message.author or message.author.bot:
+    if not message or not message.author:
         return
+    # push snipe
     push_snipe(SNIPES, message.channel.id, {
         "author_tag": str(message.author),
         "avatar_url": getattr(message.author.display_avatar, "url", ""),
         "content": message.content or "",
-        "time": datetime.now(timezone.utc).isoformat()
+        "time": datetime.now(timezone.utc).isoformat(),
+        "message_id": str(message.id)
     })
-    add_log("delete", f"{message.author} deleted message in #{message.channel} — {message.content}")
-    await send_log_embed("Message Deleted", f"**{message.author}** deleted message in {message.channel.mention}\n```{sanitize_no_mentions((message.content or '') )[:900]}```")
-
+    # attempt find deleter
+    deleted_by = "unknown"
+    try:
+        if message.guild:
+            deleted_by = await attempt_find_deleter(message.guild, message)
+    except Exception:
+        deleted_by = "unknown"
+    # details
+    details = {
+        "author_str": sanitize_no_ping(str(message.author)),
+        "author_id": message.author.id,
+        "channel": str(message.channel),
+        "message_id": str(message.id),
+        "content": message.content or "",
+        "attachments": [att.url for att in message.attachments],
+        "message_age": human_delta(datetime.now(timezone.utc) - (datetime.now(timezone.utc) - timedelta(seconds=0))) if False else (human_delta(message.created_at) if message.created_at else "Unknown"),
+        "account_age": account_age(message.author),
+        "deleted_by": deleted_by
+    }
+    gid = message.guild.id if message.guild else None
+    add_log(gid, "message_delete", None, message.author.id, details)
+    await send_log_embed_for_entry({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "guild_id": str(gid) if gid else None,
+        "action": "message_delete",
+        "actor_id": None,
+        "target_id": message.author.id,
+        "details": details
+    })
 
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
     if not before.author or before.author.bot:
-        return
-    if before.content == after.content:
         return
     push_snipe(ESNIPES, before.channel.id, {
         "author_tag": str(before.author),
@@ -423,577 +730,390 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
         "after": after.content,
         "time": datetime.now(timezone.utc).isoformat()
     })
-    add_log("edit", f"{before.author} edited message in #{before.channel}")
-    await send_log_embed("Message Edited", f"**{before.author}** edited a message in {before.channel.mention}\n**Before:**\n`{sanitize_no_mentions(before.content)[:800]}`\n**After:**\n`{sanitize_no_mentions(after.content)[:800]}`")
-
+    details = {
+        "author_id": before.author.id,
+        "channel": str(before.channel),
+        "before": before.content or "",
+        "after": after.content or ""
+    }
+    gid = before.guild.id if before.guild else None
+    add_log(gid, "message_edit", None, before.author.id, details)
+    await send_log_embed_for_entry({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "guild_id": str(gid) if gid else None,
+        "action": "message_edit",
+        "actor_id": None,
+        "target_id": before.author.id,
+        "details": details
+    })
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    add_log("join", f"{member} joined {member.guild}")
-    await send_log_embed("Member Joined", f"**{member}** joined **{member.guild.name}**")
-
+    details = {"account_age": account_age(member), "member_count": member.guild.member_count}
+    gid = member.guild.id
+    add_log(gid, "member_join", None, member.id, details)
+    await send_log_embed_for_entry({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "guild_id": str(gid),
+        "action": "member_join",
+        "actor_id": None,
+        "target_id": member.id,
+        "details": details
+    })
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    add_log("leave", f"{member} left {member.guild}")
-    await send_log_embed("Member Left", f"**{member}** left **{member.guild.name}**")
-
-
-@bot.event
-async def on_guild_role_create(role: discord.Role):
-    add_log("role_create", f"Role {role.name} created in {role.guild}")
-    await send_log_embed("Role Created", f"Role **{role.name}** created in **{role.guild.name}**")
-
-
-@bot.event
-async def on_guild_role_delete(role: discord.Role):
-    add_log("role_delete", f"Role {role.name} deleted in {role.guild}")
-    await send_log_embed("Role Deleted", f"Role **{role.name}** deleted in **{role.guild.name}**")
-
+    roles = ", ".join([r.name for r in member.roles if r.name != "@everyone"]) or "None"
+    details = {"account_age": account_age(member), "time_in_server": member_join_age(member), "roles": roles, "member_count": member.guild.member_count}
+    gid = member.guild.id
+    add_log(gid, "member_leave", None, member.id, details)
+    await send_log_embed_for_entry({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "guild_id": str(gid),
+        "action": "member_leave",
+        "actor_id": None,
+        "target_id": member.id,
+        "details": details
+    })
 
 @bot.event
-async def on_guild_channel_create(channel: discord.abc.GuildChannel):
-    add_log("channel_create", f"Channel {channel.name} created in {channel.guild}")
-    await send_log_embed("Channel Created", f"Channel **{channel.name}** created in **{channel.guild.name}**")
-
-
-@bot.event
-async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
-    add_log("channel_delete", f"Channel {channel.name} deleted in {channel.guild}")
-    await send_log_embed("Channel Deleted", f"Channel **{channel.name}** deleted in **{channel.guild.name}**")
-
-
-# on_message (process triggers, blocked words, afk, etc)
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-
-    d = reload_data()
-
-    # AFK removal if author posts
-    if str(message.author.id) in d.get("afk", {}):
-        d["afk"].pop(str(message.author.id), None)
-        save_data(d)
+async def on_member_update(before: discord.Member, after: discord.Member):
+    # roles changed?
+    before_roles = set(r.id for r in before.roles)
+    after_roles = set(r.id for r in after.roles)
+    added = after_roles - before_roles
+    removed = before_roles - after_roles
+    if added or removed:
+        # try fetch audit logs to know who changed roles (best-effort)
+        actor = None
         try:
-            await message.channel.send(f"✅ Welcome back {message.author.mention}. AFK removed.")
+            async for entry in after.guild.audit_logs(limit=6, action=discord.AuditLogAction.member_role_update):
+                delta = (datetime.now(timezone.utc) - entry.created_at).total_seconds()
+                if delta < 10 and entry.target.id == after.id:
+                    actor = entry.user
+                    break
         except Exception:
-            pass
+            actor = None
+        added_names = ", ".join([after.guild.get_role(r).name for r in added if after.guild.get_role(r)]) or "None"
+        removed_names = ", ".join([before.guild.get_role(r).name for r in removed if before.guild.get_role(r)]) or "None"
+        details = {"added": added_names, "removed": removed_names}
+        gid = after.guild.id
+        add_log(gid, "role_update", actor.id if actor else None, after.id, details)
+        await send_log_embed_for_entry({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "guild_id": str(gid),
+            "action": "role_update",
+            "actor_id": actor.id if actor else None,
+            "target_id": after.id,
+            "details": details
+        })
 
-    # If mentions include AFK users, notify
-    if message.mentions:
-        for u in message.mentions:
-            afk = d.get("afk", {}).get(str(u.id))
-            if afk:
-                reason = afk.get("reason", "AFK")
-                since = afk.get("since")
-                try:
-                    ts = int(datetime.fromisoformat(since).timestamp())
-                    await message.reply(f"{u.mention} is AFK — **{sanitize_no_mentions(reason)}** (since <t:{ts}:R>)", mention_author=False)
-                except Exception:
-                    await message.reply(f"{u.mention} is AFK — **{sanitize_no_mentions(reason)}**", mention_author=False)
+@bot.event
+async def on_member_ban(guild: discord.Guild, user: discord.User):
+    details = {"account_age": account_age(user)}
+    add_log(guild.id, "ban", None, user.id, details)
+    await send_log_embed_for_entry({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "guild_id": str(guild.id),
+        "action": "ban",
+        "actor_id": None,
+        "target_id": user.id,
+        "details": details
+    })
 
-    # Blocked words detection
-    content_compact = re.sub(r"[\s\-\_\.]", "", message.content.lower())
-    for w in d.get("blocked_words", []):
-        wc = re.sub(r"[\s\-\_\.]", "", w.lower())
-        if wc and wc in content_compact:
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            add_log("blocked_word", f"{message.author} used blocked word {w} in {message.channel}")
-            await send_log_embed("Blocked Word", f"**{message.author}** used blocked word `{w}` in {message.channel.mention}")
-            return
+@bot.event
+async def on_member_unban(guild: discord.Guild, user: discord.User):
+    details = {"account_age": account_age(user)}
+    add_log(guild.id, "unban", None, user.id, details)
+    await send_log_embed_for_entry({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "guild_id": str(guild.id),
+        "action": "unban",
+        "actor_id": None,
+        "target_id": user.id,
+        "details": details
+    })
 
-    # Triggers (exact)
-    for word, reply in d.get("triggers", {}).items():
-        if exact_word_present(message.content, word):
-            out = reply.replace("{user}", message.author.mention)
-            out = sanitize_no_mentions(out) if not is_admin(message.author.id) else out
-            try:
-                await message.channel.send(out)
-            except Exception:
-                pass
-            break
+# -----------------------
+# Commands & UI
+# -----------------------
 
-    await bot.process_commands(message)
+# Utilities for per-guild log channel
+@bot.hybrid_command(name="set_log_channel", with_app_command=True, description="Set guild's log channel (admin)")
+async def set_log_channel(ctx: commands.Context, channel: discord.TextChannel):
+    if not is_admin(ctx.author.id):
+        return await ctx.reply("Admins only.", mention_author=False)
+    d = reload_data()
+    d.setdefault("log_channels", {})[str(ctx.guild.id)] = int(channel.id)
+    save_data(d)
+    await ctx.reply(f"✅ Log channel set to {channel.mention}", mention_author=False)
+    add_log(ctx.guild.id, "set_log_channel", ctx.author.id, None, {"channel_id": channel.id})
+    await send_log_embed_for_entry({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "guild_id": str(ctx.guild.id),
+        "action": "set_log_channel",
+        "actor_id": ctx.author.id,
+        "target_id": None,
+        "details": {"channel": str(channel)}
+    })
 
+@bot.hybrid_command(name="disable_log_channel", with_app_command=True, description="Disable logs for this guild (admin)")
+async def disable_log_channel(ctx: commands.Context):
+    if not is_admin(ctx.author.id):
+        return await ctx.reply("Admins only.", mention_author=False)
+    d = reload_data()
+    d.setdefault("log_channels", {}).pop(str(ctx.guild.id), None)
+    save_data(d)
+    await ctx.reply("✅ Log channel disabled.", mention_author=False)
+    add_log(ctx.guild.id, "disable_log_channel", ctx.author.id, None, {})
 
-# ---------------------------
-# COMMANDS: Hybrid where useful
-# ---------------------------
+@bot.hybrid_command(name="show_log_channel", with_app_command=True, description="Show this guild's log channel")
+async def show_log_channel(ctx: commands.Context):
+    d = reload_data()
+    ch = d.get("log_channels", {}).get(str(ctx.guild.id))
+    if ch:
+        c = bot.get_channel(int(ch))
+        await ctx.reply(f"Log channel: {c.mention if c else str(ch)}", mention_author=False)
+    else:
+        await ctx.reply("No log channel set.", mention_author=False)
 
-# Uptime
-@bot.hybrid_command(name="uptime", with_app_command=True, description="Show bot uptime")
-async def uptime_cmd(ctx: commands.Context):
-    delta = datetime.now(timezone.utc) - BOT_START
-    days = delta.days
-    hours, rem = divmod(delta.seconds, 3600)
-    minutes, seconds = divmod(rem, 60)
-    await ctx.reply(f"⏱ Uptime: {days}d {hours}h {minutes}m {seconds}s", mention_author=False)
-    add_log("command", f"{ctx.author} used uptime")
-
-# showcommands (interactive)
-CATEGORIES = {
-    "Fun": ["cat", "8ball", "joke", "dadjoke", "coinflip", "rolldice", "rps", "avatar", "userinfo"],
-    "Moderation": ["ban", "kick", "purge", "say", "say_admin", "mute", "unmute", "give_role", "remove_role"],
-    "Management": ["add_admin", "remove_admin", "show_admins", "addpookie", "removepookie", "listpookie", "set_log_channel", "disable_log_channel", "logs", "restart", "refresh"],
-    "Cats": ["cat", "setcatchannel", "sethourlycatchannel"],
-}
-
-
-class ShowCommandsView(discord.ui.View):
-    def __init__(self, user: discord.User):
+# /log command: timeline for user
+class LogPaginationView(discord.ui.View):
+    def __init__(self, pages: List[str], author_id: int):
         super().__init__(timeout=120)
-        self.user = user
+        self.pages = pages
+        self.idx = 0
+        self.author_id = author_id
 
-    @discord.ui.select(placeholder="Choose category", min_values=1, max_values=1,
-                       options=[discord.SelectOption(label=k) for k in CATEGORIES.keys()])
-    async def select_cb(self, interaction: discord.Interaction, select: discord.ui.Select):
-        cat = select.values[0]
-        items = CATEGORIES.get(cat, [])
-        filtered = []
-        for c in items:
-            admin_only = c in ["add_admin", "remove_admin", "addpookie", "removepookie", "listpookie", "set_log_channel", "disable_log_channel", "logs", "restart", "refresh"]
-            if admin_only and not is_admin(interaction.user.id):
-                continue
-            filtered.append(c)
-        text = f"**{cat}**\n" + (", ".join(f"`/{x}`" for x in filtered) if filtered else "No commands you can use here.")
-        await interaction.response.edit_message(content=text, view=self)
+    async def update_msg(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content=self.pages[self.idx], view=self)
 
+    @discord.ui.button(label="⬅️ Prev", style=discord.ButtonStyle.secondary)
+    async def prev(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("Not your session.", ephemeral=True)
+        if self.idx > 0:
+            self.idx -= 1
+            await self.update_msg(interaction)
+        else:
+            await interaction.response.defer()
 
-@bot.hybrid_command(name="showcommands", with_app_command=True, description="Show commands you can use")
-async def showcommands_cmd(ctx: commands.Context):
-    view = ShowCommandsView(ctx.author)
-    if isinstance(ctx, discord.Interaction):
-        await ctx.response.send_message("Pick a category:", view=view, ephemeral=True)
+    @discord.ui.button(label="➡️ Next", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("Not your session.", ephemeral=True)
+        if self.idx < len(self.pages)-1:
+            self.idx += 1
+            await self.update_msg(interaction)
+        else:
+            await interaction.response.defer()
+
+@bot.hybrid_command(name="log", with_app_command=True, description="Show timeline logs for a user (admin)")
+async def log_cmd(ctx: commands.Context, user: discord.User, category: Optional[str] = None):
+    if not is_admin(ctx.author.id):
+        return await ctx.reply("Admins only.", mention_author=False)
+    d = reload_data()
+    uid = int(user.id)
+    entries = []
+    for e in d.get("logs", []):
+        if e.get("actor_id") == uid or e.get("target_id") == uid:
+            if category:
+                if not e.get("action","").startswith(category):
+                    continue
+            entries.append(e)
+    if not entries:
+        return await ctx.reply("No logs for that user.", mention_author=False)
+    # sort desc
+    entries = list(reversed(entries))
+    # format pages (10 per page)
+    pages = []
+    chunk = 10
+    for i in range(0, len(entries), chunk):
+        block = entries[i:i+chunk]
+        lines = []
+        for e in block:
+            ts = e.get("ts","")
+            action = e.get("action","")
+            actor = e.get("actor_id")
+            target = e.get("target_id")
+            details = e.get("details",{})
+            s = f"`{ts}` **{action}** • actor: `{actor}` target: `{target}` • {details.get('channel','')} • {details.get('message_id','')}"
+            lines.append(s)
+        pages.append("\n".join(lines)[:1900])
+    view = LogPaginationView(pages, ctx.author.id)
+    await ctx.reply(pages[0], view=view, mention_author=False)
+    add_log(ctx.guild.id if ctx.guild else None, "command_log_view", ctx.author.id, uid, {"count": len(entries)})
+
+# -----------------------
+# Automod interactive UI
+# -----------------------
+class AutomodView(discord.ui.View):
+    def __init__(self, guild_id: int, author_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+        self.author_id = author_id
+
+    async def refresh_message(self, interaction: discord.Interaction):
+        # update embed content
+        cfg = ensure_guild_automod(self.guild_id)
+        emb = discord.Embed(title="Automod Control Panel", color=discord.Color.yellow())
+        emb.add_field(name="Anti Link", value=str(cfg.get("anti_link")), inline=True)
+        emb.add_field(name="Anti Invite", value=str(cfg.get("anti_invite")), inline=True)
+        emb.add_field(name="Blocked Words", value=str(cfg.get("blocked_words_enabled")), inline=True)
+        spam = cfg.get("anti_spam", {})
+        emb.add_field(name="Anti Spam", value=f"enabled={spam.get('enabled')} action={spam.get('action')} threshold={spam.get('threshold')}", inline=False)
+        emb.add_field(name="Trusted users", value=str(len(cfg.get("trusted_users",[]))), inline=False)
+        await interaction.response.edit_message(embed=emb, view=self)
+
+    @discord.ui.button(label="Toggle Anti-Link", style=discord.ButtonStyle.primary)
+    async def toggle_link(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("Not your session.", ephemeral=True)
+        cfg = ensure_guild_automod(self.guild_id)
+        cfg["anti_link"] = not cfg.get("anti_link", True)
+        d = reload_data(); d["automod"][str(self.guild_id)] = cfg; save_data(d)
+        await self.refresh_message(interaction)
+        add_log(self.guild_id, "automod_config_change", interaction.user.id, None, {"key":"anti_link","value":cfg["anti_link"]})
+
+    @discord.ui.button(label="Toggle Anti-Invite", style=discord.ButtonStyle.primary)
+    async def toggle_invite(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("Not your session.", ephemeral=True)
+        cfg = ensure_guild_automod(self.guild_id)
+        cfg["anti_invite"] = not cfg.get("anti_invite", True)
+        d = reload_data(); d["automod"][str(self.guild_id)] = cfg; save_data(d)
+        await self.refresh_message(interaction)
+        add_log(self.guild_id, "automod_config_change", interaction.user.id, None, {"key":"anti_invite","value":cfg["anti_invite"]})
+
+    @discord.ui.button(label="Toggle Blocked Words", style=discord.ButtonStyle.secondary)
+    async def toggle_blocked(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("Not your session.", ephemeral=True)
+        cfg = ensure_guild_automod(self.guild_id)
+        cfg["blocked_words_enabled"] = not cfg.get("blocked_words_enabled", True)
+        d = reload_data(); d["automod"][str(self.guild_id)] = cfg; save_data(d)
+        await self.refresh_message(interaction)
+        add_log(self.guild_id, "automod_config_change", interaction.user.id, None, {"key":"blocked_words_enabled","value":cfg["blocked_words_enabled"]})
+
+    @discord.ui.button(label="Manage Trusted", style=discord.ButtonStyle.success)
+    async def manage_trusted(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("Not your session.", ephemeral=True)
+        # send modal to add/remove trusted via message (we'll give followup commands)
+        await interaction.response.send_message("Use `/add_trusted` or `/remove_trusted` to modify trusted list. Or use `/show_trusted` to view them.", ephemeral=True)
+
+# automod command
+@bot.hybrid_command(name="automod", with_app_command=True, description="Open automod control panel (admin)")
+async def automod_cmd(ctx: commands.Context):
+    if not is_admin(ctx.author.id):
+        return await ctx.reply("Admins only.", mention_author=False)
+    view = AutomodView(ctx.guild.id, ctx.author.id)
+    cfg = ensure_guild_automod(ctx.guild.id)
+    emb = discord.Embed(title="Automod Control Panel", color=discord.Color.yellow())
+    emb.add_field(name="Anti Link", value=str(cfg.get("anti_link")), inline=True)
+    emb.add_field(name="Anti Invite", value=str(cfg.get("anti_invite")), inline=True)
+    emb.add_field(name="Blocked Words", value=str(cfg.get("blocked_words_enabled")), inline=True)
+    spam = cfg.get("anti_spam", {})
+    emb.add_field(name="Anti Spam", value=f"enabled={spam.get('enabled')} action={spam.get('action')} threshold={spam.get('threshold')}", inline=False)
+    emb.add_field(name="Trusted users", value=str(len(cfg.get("trusted_users",[]))), inline=False)
+    await ctx.reply(embed=emb, view=view, mention_author=False)
+    add_log(ctx.guild.id, "command", ctx.author.id, None, {"cmd":"automod"})
+
+# Manage trusted users (admin)
+@bot.hybrid_command(name="add_trusted", with_app_command=True, description="Add trusted user (admin) — bypasses message filters")
+async def add_trusted_cmd(ctx: commands.Context, user: discord.User):
+    if not is_admin(ctx.author.id):
+        return await ctx.reply("Admins only.", mention_author=False)
+    cfg = ensure_guild_automod(ctx.guild.id)
+    if int(user.id) not in cfg.get("trusted_users", []):
+        cfg.setdefault("trusted_users", []).append(int(user.id))
+        d = reload_data()
+        d.setdefault("automod", {})[str(ctx.guild.id)] = cfg
+        save_data(d)
+        await ctx.reply(f"✅ {user.mention} added to trusted users.", mention_author=False)
+        add_log(ctx.guild.id, "trusted_add", ctx.author.id, user.id, {})
+        await send_log_embed_for_entry({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "guild_id": str(ctx.guild.id),
+            "action": "trusted_add",
+            "actor_id": ctx.author.id,
+            "target_id": user.id,
+            "details": {}
+        })
     else:
-        await ctx.reply("Pick a category (sent to your DMs too):", mention_author=False)
-        try:
-            await ctx.author.send("Pick a category:", view=view)
-        except Exception:
-            pass
-    add_log("command", f"{ctx.author} used showcommands")
+        await ctx.reply("User already trusted.", mention_author=False)
 
-# Ask for command
-@bot.hybrid_command(name="askforcommand", with_app_command=True, description="Ask owner for a command (pings owner + DMs owner)")
-async def askfor_cmd(ctx: commands.Context, *, request: str):
-    try:
-        owner = await bot.fetch_user(OWNER_ID)
-        try:
-            await owner.send(f"📩 Request from {ctx.author} ({ctx.author.id}) in {ctx.guild.name if ctx.guild else 'DM'}:\n{request[:1500]}")
-        except Exception:
-            pass
-    except Exception:
-        pass
-    d = reload_data()
-    if d.get("log_channel"):
-        ch = bot.get_channel(int(d["log_channel"]))
-        if ch:
-            try:
-                await ch.send(f"<@{OWNER_ID}> 📨 Request from {ctx.author.mention} in {ctx.guild.name if ctx.guild else 'DM'}:\n```{request[:1500]}```")
-            except Exception:
-                pass
-    await ctx.reply("✅ Sent your request to the owner (and pinged log channel if configured).", mention_author=False)
-    add_log("ask", f"{ctx.author} asked: {request[:200]}")
-
-# refresh (sync)
-@bot.hybrid_command(name="refresh", with_app_command=True, description="Refresh slash commands (admin)")
-async def refresh_cmd(ctx: commands.Context):
+@bot.hybrid_command(name="remove_trusted", with_app_command=True, description="Remove trusted user (admin)")
+async def remove_trusted_cmd(ctx: commands.Context, user: discord.User):
     if not is_admin(ctx.author.id):
         return await ctx.reply("Admins only.", mention_author=False)
-    try:
-        await bot.tree.sync()
-        await ctx.reply("✅ Slash commands refreshed.", mention_author=False)
-        add_log("admin", f"{ctx.author} refreshed slash commands")
-    except Exception as e:
-        await ctx.reply(f"Failed: {e}", mention_author=False)
-
-# restart (admin)
-@bot.hybrid_command(name="restart", with_app_command=True, description="Restart bot (admin). Uses Render API if configured.")
-async def restart_cmd(ctx: commands.Context):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    if RENDER_API_KEY and RENDER_SERVICE_ID:
-        await ctx.reply("🔁 Triggering Render deploy...", mention_author=False)
-        res = await trigger_render_deploy(RENDER_API_KEY, RENDER_SERVICE_ID)
-        await ctx.reply(f"Result: {res}", mention_author=False)
-        add_log("admin", f"{ctx.author} triggered render deploy")
+    cfg = ensure_guild_automod(ctx.guild.id)
+    if int(user.id) in cfg.get("trusted_users", []):
+        cfg["trusted_users"].remove(int(user.id))
+        d = reload_data()
+        d.setdefault("automod", {})[str(ctx.guild.id)] = cfg
+        save_data(d)
+        await ctx.reply(f"✅ {user.mention} removed from trusted users.", mention_author=False)
+        add_log(ctx.guild.id, "trusted_remove", ctx.author.id, user.id, {})
+        await send_log_embed_for_entry({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "guild_id": str(ctx.guild.id),
+            "action": "trusted_remove",
+            "actor_id": ctx.author.id,
+            "target_id": user.id,
+            "details": {}
+        })
     else:
-        await ctx.reply("🔁 Restarting process (no Render API configured)...", mention_author=False)
-        add_log("admin", f"{ctx.author} requested restart")
-        asyncio.create_task(_shutdown_exit())
+        await ctx.reply("User not in trusted list.", mention_author=False)
 
-async def _shutdown_exit(delay: float = 0.5):
-    await asyncio.sleep(delay)
-    try:
-        await bot.close()
-    finally:
-        os._exit(0)
-
-# debug (admin)
-@bot.hybrid_command(name="debug", with_app_command=True, description="Show debug info (admin)")
-async def debug_cmd(ctx: commands.Context):
+@bot.hybrid_command(name="show_trusted", with_app_command=True, description="Show trusted users for this guild")
+async def show_trusted_cmd(ctx: commands.Context):
     if not is_admin(ctx.author.id):
         return await ctx.reply("Admins only.", mention_author=False)
-    mem = "psutil not installed"
-    try:
-        import psutil
-        p = psutil.Process(os.getpid())
-        mem = f"{p.memory_info().rss/(1024*1024):.1f} MiB"
-    except Exception:
-        pass
-    delta = datetime.now(timezone.utc) - BOT_START
-    emb = discord.Embed(title="Debug Info", color=discord.Color.teal())
-    emb.add_field(name="Uptime", value=str(delta))
-    emb.add_field(name="Guilds", value=str(len(bot.guilds)))
-    emb.add_field(name="Latency", value=f"{round(bot.latency*1000)} ms")
-    emb.add_field(name="Memory", value=mem)
-    emb.add_field(name="Python", value=platform.python_version())
-    emb.add_field(name="discord.py", value=discord.__version__)
-    await ctx.reply(embed=emb, mention_author=False)
-    add_log("admin", f"{ctx.author} used debug")
+    cfg = ensure_guild_automod(ctx.guild.id)
+    arr = cfg.get("trusted_users", [])
+    if not arr:
+        return await ctx.reply("No trusted users.", mention_author=False)
+    mentions = ", ".join(f"<@{x}>" for x in arr)
+    await ctx.reply(f"Trusted users: {mentions}", mention_author=False)
 
-# eval (owner only)
-@bot.hybrid_command(name="eval", with_app_command=True, description="Eval python (owner only)")
-async def eval_cmd(ctx: commands.Context, *, code: str):
-    if not is_owner(ctx.author.id):
-        return await ctx.reply("Owner only.", mention_author=False)
-    env = {"bot": bot, "discord": discord, "commands": commands, "asyncio": asyncio, "os": os, "sys": sys}
-    try:
-        result = None
-        try:
-            result = eval(code, env)
-            if asyncio.iscoroutine(result):
-                result = await result
-        except SyntaxError:
-            exec(compile(code, "<eval>", "exec"), env)
-            result = "Executed."
-        await ctx.reply(f"Result:\n```\n{str(result)[:1900]}\n```", mention_author=False)
-    except Exception:
-        tb = traceback.format_exc()
-        await ctx.reply(f"Error:\n```\n{tb[-1900:]}\n```", mention_author=False)
-    add_log("owner", f"{ctx.author} used eval")
-
-# ---------------------------
-# Admin & Pookie management
-# ---------------------------
-@bot.hybrid_command(name="add_admin", with_app_command=True, description="Add admin (owner only)")
-async def add_admin_cmd(ctx: commands.Context, user: discord.User):
-    if not is_owner(ctx.author.id):
-        return await ctx.reply("Owner only.", mention_author=False)
-    d = reload_data()
-    if int(user.id) not in d["admins"]:
-        d["admins"].append(int(user.id))
-        save_data(d)
-    await ctx.reply(f"✅ {user.mention} added as admin.", mention_author=False)
-    add_log("admin", f"{ctx.author} added admin {user}")
-
-@bot.hybrid_command(name="remove_admin", with_app_command=True, description="Remove admin (owner only)")
-async def remove_admin_cmd(ctx: commands.Context, user: discord.User):
-    if not is_owner(ctx.author.id):
-        return await ctx.reply("Owner only.", mention_author=False)
-    d = reload_data()
-    if int(user.id) == OWNER_ID:
-        return await ctx.reply("Cannot remove owner.", mention_author=False)
-    if int(user.id) in d["admins"]:
-        d["admins"].remove(int(user.id))
-        save_data(d)
-        return await ctx.reply(f"✅ {user.mention} removed from admins.", mention_author=False)
-    await ctx.reply("User not an admin.", mention_author=False)
-
-@bot.hybrid_command(name="show_admins", with_app_command=True, description="List admins")
-async def show_admins_cmd(ctx: commands.Context):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    mentions = [f"<@{uid}>" for uid in d.get("admins", [])]
-    await ctx.reply("Admins:\n" + ("\n".join(mentions) or "None"), mention_author=False)
-    add_log("admin", f"{ctx.author} listed admins")
-
-@bot.hybrid_command(name="addpookie", with_app_command=True, description="Add pookie (admin)")
-async def addpookie_cmd(ctx: commands.Context, user: discord.User):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    if int(user.id) not in d["pookies"]:
-        d["pookies"].append(int(user.id))
-        save_data(d)
-    await ctx.reply(f"✅ {user.mention} added as pookie.", mention_author=False)
-    add_log("pookie", f"{ctx.author} added pookie {user}")
-
-@bot.hybrid_command(name="removepookie", with_app_command=True, description="Remove pookie (admin)")
-async def removepookie_cmd(ctx: commands.Context, user: discord.User):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    if int(user.id) in d["pookies"]:
-        d["pookies"].remove(int(user.id))
-        save_data(d)
-        return await ctx.reply(f"✅ {user.mention} removed from pookie.", mention_author=False)
-    await ctx.reply("User not a pookie.", mention_author=False)
-
-@bot.hybrid_command(name="listpookie", with_app_command=True, description="List pookies (admin)")
-async def listpookie_cmd(ctx: commands.Context):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    mentions = [f"<@{uid}>" for uid in d.get("pookies", [])]
-    await ctx.reply("Pookies:\n" + ("\n".join(mentions) or "None"), mention_author=False)
-    add_log("pookie", f"{ctx.author} listed pookies")
-
-# blacklist
-@bot.hybrid_command(name="blacklist_add", with_app_command=True, description="Add user to blacklist (admin)")
-async def blacklist_add_cmd(ctx: commands.Context, user: discord.User):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    if int(user.id) not in d["blacklist"]:
-        d["blacklist"].append(int(user.id))
-        save_data(d)
-    await ctx.reply(f"✅ {user.mention} blacklisted.", mention_author=False)
-    add_log("admin", f"{ctx.author} blacklisted {user}")
-
-@bot.hybrid_command(name="blacklist_remove", with_app_command=True, description="Remove user from blacklist (admin)")
-async def blacklist_remove_cmd(ctx: commands.Context, user: discord.User):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    if int(user.id) in d["blacklist"]:
-        d["blacklist"].remove(int(user.id))
-        save_data(d)
-        return await ctx.reply(f"✅ {user.mention} removed from blacklist.", mention_author=False)
-    await ctx.reply("User not blacklisted.", mention_author=False)
-
-# ---------------------------
-# Blocked words & triggers
-# ---------------------------
-@bot.hybrid_command(name="blocked_add", with_app_command=True, description="Add blocked word (admin)")
-async def blocked_add_cmd(ctx: commands.Context, *, word: str):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    w = word.strip().lower()
-    if w and w not in d["blocked_words"]:
-        d["blocked_words"].append(w)
-        save_data(d)
-    await ctx.reply(f"✅ Blocked word `{w}` added.", mention_author=False)
-    add_log("admin", f"{ctx.author} added blocked word {w}")
-
-@bot.hybrid_command(name="blocked_remove", with_app_command=True, description="Remove blocked word (admin)")
-async def blocked_remove_cmd(ctx: commands.Context, *, word: str):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    w = word.strip().lower()
-    if w in d["blocked_words"]:
-        d["blocked_words"].remove(w)
-        save_data(d)
-        return await ctx.reply(f"✅ Blocked word `{w}` removed.", mention_author=False)
-    await ctx.reply("Word not found.", mention_author=False)
-
-@bot.hybrid_command(name="blocked_list", with_app_command=True, description="List blocked words (admin)")
-async def blocked_list_cmd(ctx: commands.Context):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    await ctx.reply("\n".join(f"`{w}`" for w in d.get("blocked_words", [])[:200]) or "No blocked words.", mention_author=False)
-
-# triggers
-@bot.hybrid_command(name="trigger_add", with_app_command=True, description="Add exact-word trigger (admin). Use {user} to mention author.")
-async def trigger_add_cmd(ctx: commands.Context, word: str, *, reply: str):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    d.setdefault("triggers", {})
-    d["triggers"][word.lower()] = reply
-    save_data(d)
-    await ctx.reply(f"✅ Trigger added: `{word}` → `{reply}`", mention_author=False)
-    add_log("admin", f"{ctx.author} added trigger {word}")
-
-@bot.hybrid_command(name="trigger_remove", with_app_command=True, description="Remove trigger (admin)")
-async def trigger_remove_cmd(ctx: commands.Context, word: str):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    if word.lower() in d.get("triggers", {}):
-        d["triggers"].pop(word.lower(), None)
-        save_data(d)
-        return await ctx.reply(f"✅ Removed trigger `{word}`", mention_author=False)
-    await ctx.reply("Trigger not found.", mention_author=False)
-
-@bot.hybrid_command(name="showtrigger", with_app_command=True, description="Show triggers (admin)")
-async def showtrigger_cmd(ctx: commands.Context):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    t = d.get("triggers", {})
-    if not t:
-        return await ctx.reply("No triggers set.", mention_author=False)
-    text = "\n".join(f"`{k}` → `{v[:300]}`" for k, v in t.items())
-    await ctx.reply(text[:1900], mention_author=False)
-
-# ---------------------------
-# AFK
-# ---------------------------
-@bot.hybrid_command(name="afk", with_app_command=True, description="Set AFK with optional reason")
-async def afk_cmd(ctx: commands.Context, *, reason: Optional[str] = "AFK"):
-    d = reload_data()
-    d.setdefault("afk", {})
-    d["afk"][str(ctx.author.id)] = {"reason": reason or "AFK", "since": datetime.now(timezone.utc).isoformat()}
-    save_data(d)
-    await ctx.reply(f"✅ AFK set: **{sanitize_no_mentions(reason or 'AFK')}**", mention_author=False)
-    add_log("afk", f"{ctx.author} set AFK: {reason}")
-
-@bot.hybrid_command(name="afk_clear", with_app_command=True, description="Clear AFK")
-async def afk_clear_cmd(ctx: commands.Context):
-    d = reload_data()
-    if str(ctx.author.id) in d.get("afk", {}):
-        d["afk"].pop(str(ctx.author.id), None)
-        save_data(d)
-        return await ctx.reply("✅ AFK removed.", mention_author=False)
-    await ctx.reply("ℹ️ You were not AFK.", mention_author=False)
-
-# ---------------------------
-# Cat settings and command
-# ---------------------------
-@bot.hybrid_command(name="setcatchannel", with_app_command=True, description="Set daily cat channel at 11:00 local (admin)")
-async def setcatchannel_cmd(ctx: commands.Context, channel: discord.TextChannel):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    d["cat_channel"] = int(channel.id)
-    save_data(d)
-    await ctx.reply(f"✅ Daily cat channel set to {channel.mention}.", mention_author=False)
-    add_log("admin", f"{ctx.author} set daily cat channel {channel.id}")
-
-@bot.hybrid_command(name="sethourlycatchannel", with_app_command=True, description="Set hourly cat channel (admin)")
-async def sethourlycatchannel_cmd(ctx: commands.Context, channel: discord.TextChannel):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    d["hourly_cat_channel"] = int(channel.id)
-    save_data(d)
-    await ctx.reply(f"✅ Hourly cat channel set to {channel.mention}.", mention_author=False)
-    add_log("admin", f"{ctx.author} set hourly cat channel {channel.id}")
-
-@bot.hybrid_command(name="cat", with_app_command=True, description="Get a random cat image")
+# -----------------------
+# Cat, fun and admin commands (abridged but functional)
+# -----------------------
+@bot.hybrid_command(name="cat", with_app_command=True, description="Send random cat image")
 async def cat_cmd(ctx: commands.Context):
-    if is_blacklisted(ctx.author.id):
-        return await ctx.reply("You are blacklisted.", mention_author=False)
-    await ctx.defer() if hasattr(ctx, "defer") else None
+    await ctx.defer()
     async with aiohttp.ClientSession() as s:
-        url = await fetch_random_cat_url(s)
-    if not url:
-        return await ctx.reply("⚠️ Couldn't fetch a cat.", mention_author=False)
+        headers = {"x-api-key": CAT_API_KEY} if CAT_API_KEY else {}
+        try:
+            async with s.get("https://api.thecatapi.com/v1/images/search", headers=headers, timeout=15) as r:
+                if r.status == 200:
+                    j = await r.json()
+                    url = j[0].get("url") if j else "https://cataas.com/cat"
+                else:
+                    url = "https://cataas.com/cat"
+        except Exception:
+            url = "https://cataas.com/cat"
     await ctx.reply(url, mention_author=False)
-    add_log("cat", f"{ctx.author} requested cat")
+    add_log(ctx.guild.id if ctx.guild else None, "cat", ctx.author.id, ctx.author.id, {"url": url})
 
-# ---------------------------
-# Say commands
-# ---------------------------
 @bot.hybrid_command(name="say", with_app_command=True, description="Bot repeats text (no pings)")
 async def say_cmd(ctx: commands.Context, *, text: str):
-    safe = sanitize_no_mentions(text)
-    try:
-        await ctx.reply("✅ Sent (no pings).", mention_author=False)
-    except Exception:
-        pass
-    try:
-        await ctx.send(safe, allowed_mentions=discord.AllowedMentions.none())
-    except Exception:
-        await ctx.send(safe)
-    add_log("command", f"{ctx.author} used say")
+    safe = sanitize_no_ping(text)
+    await ctx.send(safe, allowed_mentions=discord.AllowedMentions.none())
+    await ctx.reply("✅ Sent (no pings).", ephemeral=True, mention_author=False)
+    add_log(ctx.guild.id if ctx.guild else None, "say_public", ctx.author.id, None, {"text": safe})
 
 @bot.hybrid_command(name="say_admin", with_app_command=True, description="Admin say (pings allowed)")
 async def say_admin_cmd(ctx: commands.Context, *, text: str):
     if not is_admin(ctx.author.id):
         return await ctx.reply("Admins only.", mention_author=False)
+    await ctx.channel.send(text)
     await ctx.reply("✅ Sent.", mention_author=False)
-    await ctx.send(text)
-    add_log("admin", f"{ctx.author} used say_admin")
+    add_log(ctx.guild.id, "say_admin", ctx.author.id, None, {"text": text})
 
-# ---------------------------
-# Moderation commands (ban/kick/purge)
-# ---------------------------
-# Slash ban
-@bot.tree.command(name="ban", description="Ban a member (admin)")
-@app_commands.describe(member="Member to ban", reason="Reason")
-async def slash_ban(interaction: discord.Interaction, member: discord.Member, reason: Optional[str] = "No reason"):
-    if not is_admin(interaction.user.id):
-        return await interaction.response.send_message("Admins only.", ephemeral=True)
-    try:
-        await member.ban(reason=reason)
-        await interaction.response.send_message(f"🔨 {member.mention} banned. Reason: {sanitize_no_mentions(reason)}")
-        add_log("mod", f"{interaction.user} banned {member} — {reason}")
-        await send_log_embed("Ban", f"{interaction.user.mention} banned {member.mention} — {sanitize_no_mentions(reason)}")
-    except Exception as e:
-        await interaction.response.send_message(f"Failed: {e}", ephemeral=True)
-
-# Prefix ban
-@bot.command(name="ban")
-async def prefix_ban(ctx: commands.Context, target: str, *, reason: Optional[str] = "No reason"):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    uid = None
-    m = re.match(r"<@!?(\d+)>", target)
-    if m:
-        uid = int(m.group(1))
-    else:
-        try:
-            uid = int(target)
-        except Exception:
-            return await ctx.reply("Provide mention or id.", mention_author=False)
-    member = ctx.guild.get_member(uid) if ctx.guild else None
-    try:
-        if member:
-            await member.ban(reason=reason)
-            await ctx.reply(f"🔨 {member.mention} banned. Reason: {sanitize_no_mentions(reason)}", mention_author=False)
-        else:
-            await ctx.guild.ban(discord.Object(id=uid), reason=reason)
-            await ctx.reply(f"🔨 Banned ID {uid}.", mention_author=False)
-        add_log("mod", f"{ctx.author} banned {target} — {reason}")
-        await send_log_embed("Ban", f"{ctx.author.mention} banned {target} — {sanitize_no_mentions(reason)}")
-    except Exception as e:
-        await ctx.reply(f"Failed: {e}", mention_author=False)
-
-# Slash kick
-@bot.tree.command(name="kick", description="Kick a member (admin)")
-@app_commands.describe(member="Member to kick", reason="Reason")
-async def slash_kick(interaction: discord.Interaction, member: discord.Member, reason: Optional[str] = "No reason"):
-    if not is_admin(interaction.user.id):
-        return await interaction.response.send_message("Admins only.", ephemeral=True)
-    try:
-        await member.kick(reason=reason)
-        await interaction.response.send_message(f"👢 {member.mention} kicked.")
-        add_log("mod", f"{interaction.user} kicked {member} — {reason}")
-        await send_log_embed("Kick", f"{interaction.user.mention} kicked {member.mention} — {sanitize_no_mentions(reason)}")
-    except Exception as e:
-        await interaction.response.send_message(f"Failed: {e}", ephemeral=True)
-
-# Prefix kick
-@bot.command(name="kick")
-async def prefix_kick(ctx: commands.Context, target: str, *, reason: Optional[str] = "No reason"):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    m = re.match(r"<@!?(\d+)>", target)
-    uid = int(m.group(1)) if m else (int(target) if target.isdigit() else None)
-    if not uid:
-        return await ctx.reply("Provide mention or id.", mention_author=False)
-    member = ctx.guild.get_member(uid)
-    if not member:
-        return await ctx.reply("Member not found in this guild.", mention_author=False)
-    try:
-        await member.kick(reason=reason)
-        await ctx.reply(f"👢 {member.mention} kicked. Reason: {sanitize_no_mentions(reason)}", mention_author=False)
-        add_log("mod", f"{ctx.author} kicked {member} — {reason}")
-        await send_log_embed("Kick", f"{ctx.author.mention} kicked {member.mention} — {sanitize_no_mentions(reason)}")
-    except Exception as e:
-        await ctx.reply(f"Failed: {e}", mention_author=False)
-
-# Purge
-@bot.hybrid_command(name="purge", with_app_command=True, description="Delete up to 100 messages (admin/pookie)")
+# moderation commands (ban/kick/purge) — kept simple
+@bot.hybrid_command(name="purge", with_app_command=True, description="Purge up to 100 messages (admin/pookie)")
 async def purge_cmd(ctx: commands.Context, amount: Optional[int] = 10):
     if not (is_admin(ctx.author.id) or is_pookie(ctx.author.id)):
         return await ctx.reply("Admins/Pookie only.", mention_author=False)
@@ -1003,347 +1123,53 @@ async def purge_cmd(ctx: commands.Context, amount: Optional[int] = 10):
         m = await ctx.send(f"🧹 Deleted {len(deleted)} messages.")
         await asyncio.sleep(3)
         await m.delete()
-        add_log("mod", f"{ctx.author} purged {len(deleted)} messages in {ctx.channel}")
-        await send_log_embed("Purge", f"{ctx.author.mention} purged {len(deleted)} messages in {ctx.channel.mention}")
+        add_log(ctx.guild.id if ctx.guild else None, "purge", ctx.author.id, None, {"count": len(deleted), "channel": str(ctx.channel)})
+        await send_log_embed_for_entry({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "guild_id": str(ctx.guild.id),
+            "action": "purge",
+            "actor_id": ctx.author.id,
+            "target_id": None,
+            "details": {"count": len(deleted), "channel": str(ctx.channel)}
+        })
     except Exception as e:
         await ctx.reply(f"Failed: {e}", mention_author=False)
 
-# ---------------------------
-# Warn system
-# ---------------------------
-@bot.hybrid_command(name="warn", with_app_command=True, description="Warn a user (admin/pookie)")
-async def warn_cmd(ctx: commands.Context, user: discord.Member, *, reason: Optional[str] = "No reason"):
-    if not (is_admin(ctx.author.id) or is_pookie(ctx.author.id)):
-        return await ctx.reply("Admins/Pookie only.", mention_author=False)
-    d = reload_data()
-    d.setdefault("warns", {})
-    lst = d["warns"].setdefault(str(user.id), [])
-    entry = {"mod": ctx.author.id, "reason": reason, "time": datetime.now(timezone.utc).isoformat()}
-    lst.append(entry)
-    save_data(d)
-    await ctx.reply(f"⚠️ Warned {user.mention} — {sanitize_no_mentions(reason)}", mention_author=False)
-    add_log("warn", f"{ctx.author} warned {user} — {reason}")
-    await send_log_embed("Warn", f"{ctx.author.mention} warned {user.mention}: {sanitize_no_mentions(reason)}")
-
-@bot.hybrid_command(name="show_warns", with_app_command=True, description="Show warns for a user (admin)")
-async def show_warns_cmd(ctx: commands.Context, user: discord.User):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    warns = d.get("warns", {}).get(str(user.id), [])
-    if not warns:
-        return await ctx.reply("No warns.", mention_author=False)
-    text = "\n".join(f"- {w['time']} by <@{w['mod']}>: {w['reason']}" for w in warns[-20:])
-    await ctx.reply(text[:1900], mention_author=False)
-
-@bot.hybrid_command(name="remove_warn", with_app_command=True, description="Remove a warn (admin)")
-async def remove_warn_cmd(ctx: commands.Context, user: discord.User, index: int = 0):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    arr = d.get("warns", {}).get(str(user.id), [])
-    if not arr or index < 0 or index >= len(arr):
-        return await ctx.reply("No such warn index.", mention_author=False)
-    removed = arr.pop(index)
-    save_data(d)
-    await ctx.reply("✅ Removed warn.", mention_author=False)
-    add_log("warn_remove", f"{ctx.author} removed warn for {user}: {removed}")
-
-# ---------------------------
-# Roles (give/remove/temp), mute/unmute, lock/unlock channel
-# ---------------------------
-@bot.hybrid_command(name="give_role", with_app_command=True, description="Give a role to a member (admin)")
-async def give_role_cmd(ctx: commands.Context, member: discord.Member, role: discord.Role):
+# Debug (admin)
+@bot.hybrid_command(name="debug", with_app_command=True, description="Debug info (admin)")
+async def debug_cmd(ctx: commands.Context):
     if not is_admin(ctx.author.id):
         return await ctx.reply("Admins only.", mention_author=False)
     try:
-        await member.add_roles(role, reason=f"Given by {ctx.author}")
-        await ctx.reply(f"✅ Given role {role.name} to {member.mention}", mention_author=False)
-        add_log("role", f"{ctx.author} gave role {role.id} to {member.id}")
-        await send_log_embed("Role Given", f"{ctx.author.mention} gave role {role.name} to {member.mention}")
-    except Exception as e:
-        await ctx.reply(f"Failed: {e}", mention_author=False)
-
-@bot.hybrid_command(name="remove_role", with_app_command=True, description="Remove a role from a member (admin)")
-async def remove_role_cmd(ctx: commands.Context, member: discord.Member, role: discord.Role):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    try:
-        await member.remove_roles(role, reason=f"Removed by {ctx.author}")
-        await ctx.reply(f"✅ Removed role {role.name} from {member.mention}", mention_author=False)
-        add_log("role", f"{ctx.author} removed role {role.id} from {member.id}")
-        await send_log_embed("Role Removed", f"{ctx.author.mention} removed role {role.name} from {member.mention}")
-    except Exception as e:
-        await ctx.reply(f"Failed: {e}", mention_author=False)
-
-@bot.hybrid_command(name="give_temp_role", with_app_command=True, description="Give a temporary role (e.g., 10m) (admin)")
-async def give_temp_role_cmd(ctx: commands.Context, member: discord.Member, role: discord.Role, duration: str):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    m = re.match(r"^(\d+)([smhd])$", duration.strip().lower())
-    if not m:
-        return await ctx.reply("Invalid duration (10m, 2h, 4d).", mention_author=False)
-    num = int(m.group(1)); unit = m.group(2)
-    seconds = num * (1 if unit == "s" else 60 if unit == "m" else 3600 if unit == "h" else 86400)
-    try:
-        await member.add_roles(role, reason=f"Temp role by {ctx.author}")
-        expire_dt = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
-        d = reload_data()
-        d.setdefault("temp_roles", [])
-        d["temp_roles"].append({"guild_id": ctx.guild.id, "user_id": member.id, "role_id": role.id, "expires_at": expire_dt})
-        save_data(d)
-        await ctx.reply(f"✅ Given {role.name} to {member.mention} for {duration}", mention_author=False)
-        add_log("temp_role", f"{ctx.author} gave {role.id} to {member.id} until {expire_dt}")
-        await send_log_embed("Temp Role", f"{ctx.author.mention} gave {role.name} to {member.mention} until {expire_dt}")
-    except Exception as e:
-        await ctx.reply(f"Failed: {e}", mention_author=False)
-
-async def ensure_muted_role(guild: discord.Guild) -> Optional[discord.Role]:
-    role = discord.utils.get(guild.roles, name="Muted")
-    if role:
-        return role
-    try:
-        role = await guild.create_role(name="Muted", reason="Create Muted role for moderation")
-        for ch in guild.text_channels:
-            try:
-                await ch.set_permissions(role, send_messages=False, add_reactions=False)
-            except Exception:
-                pass
-        return role
+        import psutil
+        p = psutil.Process(os.getpid())
+        mem = f"{p.memory_info().rss/(1024*1024):.1f} MiB"
     except Exception:
-        return None
-
-@bot.hybrid_command(name="mute", with_app_command=True, description="Mute a member (admin). Optionally specify duration like 10m")
-async def mute_cmd(ctx: commands.Context, member: discord.Member, duration: Optional[str] = None):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    try:
-        role = await ensure_muted_role(ctx.guild)
-        if not role:
-            return await ctx.reply("Failed to create Muted role.", mention_author=False)
-        await member.add_roles(role, reason=f"Muted by {ctx.author}")
-        if duration:
-            m = re.match(r"^(\d+)([smhd])$", duration.strip().lower())
-            if m:
-                num = int(m.group(1)); unit = m.group(2)
-                seconds = num * (1 if unit == "s" else 60 if unit == "m" else 3600 if unit == "h" else 86400)
-                expire = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
-                d = reload_data()
-                d.setdefault("temp_roles", [])
-                d["temp_roles"].append({"guild_id": ctx.guild.id, "user_id": member.id, "role_id": role.id, "expires_at": expire})
-                save_data(d)
-        await ctx.reply(f"🔇 Muted {member.mention}", mention_author=False)
-        add_log("mute", f"{ctx.author} muted {member}")
-        await send_log_embed("Mute", f"{ctx.author.mention} muted {member.mention}")
-    except Exception as e:
-        await ctx.reply(f"Failed: {e}", mention_author=False)
-
-@bot.hybrid_command(name="unmute", with_app_command=True, description="Unmute a member (admin)")
-async def unmute_cmd(ctx: commands.Context, member: discord.Member):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    try:
-        role = discord.utils.get(ctx.guild.roles, name="Muted")
-        if role:
-            await member.remove_roles(role, reason=f"Unmuted by {ctx.author}")
-            await ctx.reply(f"🔊 Unmuted {member.mention}", mention_author=False)
-            add_log("unmute", f"{ctx.author} unmuted {member}")
-            await send_log_embed("Unmute", f"{ctx.author.mention} unmuted {member.mention}")
-        else:
-            await ctx.reply("No Muted role found.", mention_author=False)
-    except Exception as e:
-        await ctx.reply(f"Failed: {e}", mention_author=False)
-
-@bot.hybrid_command(name="lock_channel", with_app_command=True, description="Lock current channel (admin)")
-async def lock_channel_cmd(ctx: commands.Context):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    ch = ctx.channel
-    try:
-        overwrite = ch.overwrites_for(ctx.guild.default_role)
-        overwrite.send_messages = False
-        await ch.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=f"Locked by {ctx.author}")
-        await ctx.reply("🔒 Channel locked.", mention_author=False)
-        add_log("channel", f"{ctx.author} locked {ch}")
-        await send_log_embed("Channel Locked", f"{ctx.author.mention} locked {ch.mention}")
-    except Exception as e:
-        await ctx.reply(f"Failed: {e}", mention_author=False)
-
-@bot.hybrid_command(name="unlock_channel", with_app_command=True, description="Unlock current channel (admin)")
-async def unlock_channel_cmd(ctx: commands.Context):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    ch = ctx.channel
-    try:
-        overwrite = ch.overwrites_for(ctx.guild.default_role)
-        overwrite.send_messages = None
-        await ch.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=f"Unlocked by {ctx.author}")
-        await ctx.reply("🔓 Channel unlocked.", mention_author=False)
-        add_log("channel", f"{ctx.author} unlocked {ch}")
-        await send_log_embed("Channel Unlocked", f"{ctx.author.mention} unlocked {ch.mention}")
-    except Exception as e:
-        await ctx.reply(f"Failed: {e}", mention_author=False)
-
-# ---------------------------
-# Snipe / Esnipe commands
-# ---------------------------
-@bot.hybrid_command(name="snipe", with_app_command=True, description="Show recent deleted messages (this channel)")
-async def snipe_cmd(ctx: commands.Context):
-    items = SNIPES.get(ctx.channel.id, [])
-    if not items:
-        return await ctx.reply("Nothing to snipe here.", mention_author=False)
-    view = SnipeView(items)
-    await ctx.reply(embed=view.make_embed(), view=view, mention_author=False)
-
-@bot.hybrid_command(name="esnipe", with_app_command=True, description="Show recent edited messages (this channel)")
-async def esnipe_cmd(ctx: commands.Context):
-    items = ESNIPES.get(ctx.channel.id, [])
-    if not items:
-        return await ctx.reply("Nothing to esnipe here.", mention_author=False)
-    view = SnipeView(items)
-    await ctx.reply(embed=view.make_embed(), view=view, mention_author=False)
-
-# ---------------------------
-# Avatar / Userinfo / Guildinfo
-# ---------------------------
-@bot.hybrid_command(name="avatar", with_app_command=True, description="Show a user's avatar")
-async def avatar_cmd(ctx: commands.Context, user: Optional[discord.User] = None):
-    u = user or ctx.author
-    emb = discord.Embed(title=f"{u}", color=discord.Color.green())
-    emb.set_image(url=u.display_avatar.url)
+        mem = "psutil missing"
+    delta = datetime.now(timezone.utc) - BOT_START
+    emb = discord.Embed(title="Debug", color=discord.Color.teal())
+    emb.add_field(name="Uptime", value=str(delta))
+    emb.add_field(name="Guilds", value=str(len(bot.guilds)))
+    emb.add_field(name="Latency", value=f"{round(bot.latency*1000)} ms")
+    emb.add_field(name="Memory", value=mem)
+    emb.add_field(name="Python", value=platform.python_version())
+    emb.add_field(name="discord.py", value=discord.__version__)
     await ctx.reply(embed=emb, mention_author=False)
-    add_log("command", f"{ctx.author} used avatar")
+    add_log(ctx.guild.id if ctx.guild else None, "debug", ctx.author.id, None, {})
 
-@bot.hybrid_command(name="userinfo", with_app_command=True, description="Show user info")
-async def userinfo_cmd(ctx: commands.Context, user: Optional[discord.User] = None):
-    u = user or ctx.author
-    emb = discord.Embed(title=f"{u}", color=discord.Color.blurple())
-    emb.add_field(name="ID", value=str(u.id))
-    emb.add_field(name="Bot?", value=str(u.bot))
-    emb.set_thumbnail(url=u.display_avatar.url)
-    await ctx.reply(embed=emb, mention_author=False)
-    add_log("command", f"{ctx.author} used userinfo")
-
-@bot.hybrid_command(name="guildinfo", with_app_command=True, description="Show guild info (admin). Provide guild id")
-async def guildinfo_cmd(ctx: commands.Context, guild_id: str):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    try:
-        gid = int(guild_id)
-    except Exception:
-        return await ctx.reply("Invalid guild id.", mention_author=False)
-    g = bot.get_guild(gid)
-    if not g:
-        return await ctx.reply("Bot not in that guild.", mention_author=False)
-    inv = None
-    try:
-        for ch in g.text_channels:
-            if ch.permissions_for(g.me).create_instant_invite:
-                inv_obj = await ch.create_invite(max_age=3600, max_uses=1, unique=True)
-                inv = str(inv_obj)
-                break
-    except Exception:
-        inv = None
-    emb = discord.Embed(title=f"{g.name}", color=discord.Color.gold())
-    emb.add_field(name="ID", value=str(g.id))
-    emb.add_field(name="Owner", value=f"{g.owner} ({g.owner_id})")
-    emb.add_field(name="Members", value=str(g.member_count))
-    emb.add_field(name="Channels", value=f"{len(g.text_channels)} text / {len(g.voice_channels)} voice")
-    if inv:
-        emb.add_field(name="Invite (1h)", value=inv)
-    await ctx.reply(embed=emb, mention_author=False)
-    add_log("command", f"{ctx.author} used guildinfo {gid}")
-
-# ---------------------------
-# Log channel management (must send embeds for everything)
-# ---------------------------
-@bot.hybrid_command(name="set_log_channel", with_app_command=True, description="Set channel for logs (admin)")
-async def set_log_channel_cmd(ctx: commands.Context, channel: discord.TextChannel):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    d["log_channel"] = int(channel.id)
-    save_data(d)
-    await ctx.reply(f"✅ Log channel set to {channel.mention}", mention_author=False)
-    add_log("admin", f"{ctx.author} set log channel {channel.id}")
-    # send test embed
-    await send_log_embed("Logs", f"Log channel set to {channel.mention} by {ctx.author.mention}")
-
-@bot.hybrid_command(name="disable_log_channel", with_app_command=True, description="Disable log channel (admin)")
-async def disable_log_channel_cmd(ctx: commands.Context):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    d["log_channel"] = None
-    save_data(d)
-    await ctx.reply("✅ Log channel disabled.", mention_author=False)
-    add_log("admin", f"{ctx.author} disabled log channel")
-
-@bot.hybrid_command(name="logs", with_app_command=True, description="Show recent logs (admin)")
-async def logs_cmd(ctx: commands.Context, count: Optional[int] = 10):
-    if not is_admin(ctx.author.id):
-        return await ctx.reply("Admins only.", mention_author=False)
-    d = reload_data()
-    entries = d.get("logs", [])[-min(max(1, count or 10), 100):]
-    text = "\n".join(f"`{e['ts']}` {e['kind']}: {e['message']}" for e in entries) or "No logs."
-    await ctx.reply(text[:1900], mention_author=False)
-
-# ---------------------------
-# Fun commands (8ball, jokes, dadjoke, coin, dice, rps)
-# ---------------------------
-@bot.hybrid_command(name="8ball", with_app_command=True, description="Ask the magic 8-ball")
-async def eightball_cmd(ctx: commands.Context, *, question: str):
-    answers = ["Yes.", "No.", "Maybe.", "Absolutely!", "Ask again later.", "Definitely not.", "Probably.", "Unlikely."]
-    await ctx.reply(f"🎱 {random.choice(answers)}", mention_author=False)
-
-@bot.hybrid_command(name="joke", with_app_command=True, description="Tell a joke")
-async def joke_cmd(ctx: commands.Context):
-    jokes = ["I told my computer I needed a break — it went to sleep.", "Why do programmers prefer dark mode? Because light attracts bugs."]
-    await ctx.reply(random.choice(jokes), mention_author=False)
-
-@bot.hybrid_command(name="dadjoke", with_app_command=True, description="Tell a dad joke")
-async def dadjoke_cmd(ctx: commands.Context):
-    jokes = ["I used to play piano by ear — now I use my hands.", "Why don't eggs tell jokes? They'd crack each other up."]
-    await ctx.reply(random.choice(jokes), mention_author=False)
-
-@bot.hybrid_command(name="coinflip", with_app_command=True, description="Flip a coin")
-async def coinflip_cmd(ctx: commands.Context):
-    await ctx.reply("Heads" if random.random() < 0.5 else "Tails", mention_author=False)
-
-@bot.hybrid_command(name="rolldice", with_app_command=True, description="Roll a dice")
-async def rolldice_cmd(ctx: commands.Context):
-    await ctx.reply(f"🎲 {random.randint(1,6)}", mention_author=False)
-
-@bot.hybrid_command(name="rps", with_app_command=True, description="Rock Paper Scissors")
-async def rps_cmd(ctx: commands.Context, choice: str):
-    choice = choice.lower().strip()
-    if choice not in ("rock", "paper", "scissors"):
-        return await ctx.reply("Choose rock/paper/scissors.", mention_author=False)
-    bot_choice = random.choice(["rock", "paper", "scissors"])
-    result = "Draw"
-    if (choice, bot_choice) in [("rock", "scissors"), ("paper", "rock"), ("scissors", "paper")]:
-        result = "You win!"
-    elif choice != bot_choice:
-        result = "You lose!"
-    await ctx.reply(f"You: **{choice}** | Bot: **{bot_choice}** → {result}", mention_author=False)
-
-# ---------------------------
-# Final initialization
-# ---------------------------
-# ensure owner + extras in admins
-_d = reload_data()
-if OWNER_ID not in _d.get("admins", []):
-    _d["admins"].append(int(OWNER_ID))
-for aid in DEFAULT_EXTRA_ADMINS:
-    if aid not in _d["admins"]:
-        _d["admins"].append(int(aid))
-save_data(_d)
+# -----------------------
+# Ensure owner & run
+# -----------------------
+# make sure owner in admins
+dtemp = reload_data()
+if OWNER_ID not in dtemp.get("admins", []):
+    dtemp["admins"].append(OWNER_ID)
+save_data(dtemp)
 
 BOT_START = datetime.now(timezone.utc)
 
-def run():
+def run_bot():
     bot.run(DISCORD_TOKEN)
 
-
 if __name__ == "__main__":
-    run()
+    run_bot()
