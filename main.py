@@ -260,13 +260,13 @@ async def send_log(guild:discord.Guild, embed:discord.Embed):
     except:
         pass
 
-def account_age_str(user:discord.abc.User):
+def account_age_str(user: discord.abc.User):
     created = snowflake_age(user.id)
     if not created:
         return "N/A"
     delta = datetime.utcnow() - created
     days = delta.days
-    return f"{days} days (created <t:{int(created.timestamp())}:
+    return f"{days} days (created <t:{int(created.timestamp())}:R>)"
 # ============================
 # MEMBER JOIN / LEAVE LOGGING
 # ============================
