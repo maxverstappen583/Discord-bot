@@ -244,33 +244,105 @@ class SnipeView(discord.ui.View):
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
 # ---------------------------
-# LOGGING
+# LOGGING SYSTEM
+# ---------------------------
+async def send_log(guild: discord.Guild, embed: discord.Embed):
+    """Send a log embed to the configured log channel, or fallback to #logs."""
+    cid = get_log_channel_id(guild.id)  # your stored log channel
+    ch = None
+
+    # Try stored channel
+    if cid:
+        ch = guild.get_channel(cid)
+        if not ch:
+            try:
+                ch = await guild.fetch_channel(cid)
+            except Exception as e:
+                print(f"[LOG] Could not fetch log channel {cid}: {e}")
+
+    # Fallback: try to find a channel literally called "logs"
+    if not ch:
+        for c in guild.text_channels:
+            if c.name.lower() == "logs":
+                ch = c
+                break
+
+    if not ch:
+        print(f"[LOG] No valid log channel for {guild.name} ({guild.id})")
+        return
+
+    try:
+        await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as e:
+        print(f"[LOG] Failed to send log to {ch}: {e}")
+
+
+def account_age_str(user: discord.abc.User):
+    """Return how old an account is in days and relative timestamp."""
+    created = snowflake_age(user.id)
+    if not created:
+        return "N/A"
+    delta = datetime.utcnow() - created
+    days = delta.days
+    return f"{days} days (created <t:{int(created.timestamp())}:R>)"
+
+
+# ---------------------------
+# EVENTS
 # ---------------------------
 @bot.event
 async def on_member_join(member: discord.Member):
     embed = discord.Embed(
-        title="👋 Member Joined",
-        description=f"{member.mention} ({member.id})",
+        title="📥 Member Joined",
+        description=f"{member.mention} ({member.id}) joined.",
         color=discord.Color.green(),
         timestamp=datetime.utcnow()
     )
     embed.add_field(name="Account Age", value=account_age_str(member), inline=False)
-    embed.set_thumbnail(url=member.display_avatar.url)
-
     await send_log(member.guild, embed)
 
 
 @bot.event
 async def on_member_remove(member: discord.Member):
     embed = discord.Embed(
-        title="👋 Member Left",
-        description=f"{member.mention} ({member.id})",
+        title="📤 Member Left",
+        description=f"{member.mention} ({member.id}) left.",
         color=discord.Color.red(),
         timestamp=datetime.utcnow()
     )
-    embed.add_field(name="Account Age", value=account_age_str(member), inline=False)
-    embed.set_thumbnail(url=member.display_avatar.url)
+    await send_log(member.guild, embed)
 
+
+@bot.event
+async def on_member_ban(guild: discord.Guild, user: discord.User):
+    embed = discord.Embed(
+        title="⛔ User Banned",
+        description=f"{user.mention} ({user.id}) was banned.",
+        color=discord.Color.dark_red(),
+        timestamp=datetime.utcnow()
+    )
+    await send_log(guild, embed)
+
+
+@bot.event
+async def on_member_unban(guild: discord.Guild, user: discord.User):
+    embed = discord.Embed(
+        title="✅ User Unbanned",
+        description=f"{user.mention} ({user.id}) was unbanned.",
+        color=discord.Color.blue(),
+        timestamp=datetime.utcnow()
+    )
+    await send_log(guild, embed)
+
+
+@bot.event
+async def on_member_kick(member: discord.Member):
+    embed = discord.Embed(
+        title="👢 User Kicked",
+        description=f"{member.mention} ({member.id}) was kicked.",
+        color=discord.Color.orange(),
+        timestamp=datetime.utcnow()
+    )
     await send_log(member.guild, embed)
 
 # ---------------------------
