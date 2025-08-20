@@ -1314,7 +1314,16 @@ async def slash_debug(inter:discord.Interaction):
     e.add_field(name="RAM(MB)", value=f"{mem:.1f}")
     e.add_field(name="Python", value=platform.python_version())
     e.add_field(name="discord.py", value=discord.__version__)
-    await inter.response.send_message(embed=e, ephemeral=True)
+    await inter.response.send_message(embed=e, ephemeral=# ---------------------------
+
+# LOAD COGS
+# ---------------------------
+async def load_extensions():
+    await bot.load_extension("afk")  # loads afk.py
+
+@bot.event
+async def setup_hook():
+    await load_extensions()
 
 # ---------------------------
 # RUN
