@@ -266,7 +266,35 @@ def account_age_str(user:discord.abc.User):
         return "N/A"
     delta = datetime.utcnow() - created
     days = delta.days
-    return f"{days} days (created <t:{int(created.timestamp())}:R>)"
+    return f"{days} days (created <t:{int(created.timestamp())}:
+# ============================
+# MEMBER JOIN / LEAVE LOGGING
+# ============================
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    embed = discord.Embed(
+        title="📥 Member Joined",
+        description=f"{member.mention} ({member.id}) joined the server.",
+        color=discord.Color.green(),
+        timestamp=datetime.utcnow()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Account Age", value=account_age_str(member), inline=False)
+    await send_log(member.guild, embed)
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    embed = discord.Embed(
+        title="📤 Member Left",
+        description=f"{member.mention} ({member.id}) left the server.",
+        color=discord.Color.red(),
+        timestamp=datetime.utcnow()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Account Age", value=account_age_str(member), inline=False)
+    await send_log(member.guild, embed)
 
 # ---------------------------
 # AUTOMOD HELPERS
