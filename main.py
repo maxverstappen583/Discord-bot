@@ -246,27 +246,32 @@ class SnipeView(discord.ui.View):
 # ---------------------------
 # LOGGING
 # ---------------------------
-async def send_log(guild:discord.Guild, embed:discord.Embed):
-    cid = get_log_channel_id(guild.id)
-    if not cid: return
-    ch = guild.get_channel(cid)
-    if not ch:
-        try:
-            ch = await guild.fetch_channel(cid)
-        except: 
-            return
-    try:
-        await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-    except:
-        pass
+@bot.event
+async def on_member_join(member: discord.Member):
+    embed = discord.Embed(
+        title="👋 Member Joined",
+        description=f"{member.mention} ({member.id})",
+        color=discord.Color.green(),
+        timestamp=datetime.utcnow()
+    )
+    embed.add_field(name="Account Age", value=account_age_str(member), inline=False)
+    embed.set_thumbnail(url=member.display_avatar.url)
 
-def account_age_str(user:discord.abc.User):
-    created = snowflake_age(user.id)
-    if not created:
-        return "N/A"
-    delta = datetime.utcnow() - created
-    days = delta.days
-    return f"{days} days (created <t:{int(created.timestamp())}:R>)"
+    await send_log(member.guild, embed)
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    embed = discord.Embed(
+        title="👋 Member Left",
+        description=f"{member.mention} ({member.id})",
+        color=discord.Color.red(),
+        timestamp=datetime.utcnow()
+    )
+    embed.add_field(name="Account Age", value=account_age_str(member), inline=False)
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    await send_log(member.guild, embed)
 
 # ---------------------------
 # AUTOMOD HELPERS
